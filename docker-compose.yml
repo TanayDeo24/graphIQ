@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: graphiq_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-graphiq}
+      POSTGRES_USER: ${POSTGRES_USER:-graphiq}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-graphiq_dev_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - graphiq_pg_data:/var/lib/postgresql/data
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-graphiq} -d ${POSTGRES_DB:-graphiq}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  graphiq_pg_data:

@@ -1,0 +1,36 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+
+# --- Node ---
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+npm-debug.log*
+
+# --- Env / secrets ---
+.env
+*.pem
+*.key
+kaggle.json
+
+# --- Data (generated outputs are regenerated via scripts, not committed) ---
+# data/raw/ IS committed: it's the small (1,470-row) IBM HR Analytics dataset,
+# checked in so the repo is reproducible without requiring Kaggle credentials.
+data/generated/*
+!data/generated/.gitkeep
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
