@@ -16,8 +16,13 @@ deliberate, Western-Electric-style tuning choices (not magic numbers):
 
 Operates on monthly-aggregated spend per (employee_id, merchant_category)
 — a genuinely different granularity from the transaction-level Isolation
-Forest / autoencoder detectors, which is what lets CUSUM catch drift that
-a point-anomaly detector structurally cannot.
+Forest / autoencoder detectors. That was the design intent for why this
+detector should catch slow_drift better than a point-anomaly detector; the
+standalone per-detector evaluation in src/models/spend/evaluate.py does not
+bear that out with this tuning (k=0.5, h=5) against this generation's
+slow_drift parameters — CUSUM's own slow_drift PR-AUC comes out lower than
+both Isolation Forest's and the autoencoder's. See the README's "Spend"
+results section for the honest comparison table and numbers.
 """
 
 import numpy as np

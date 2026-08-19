@@ -3,6 +3,7 @@ import { api } from "../api";
 import AnomalyTable from "../components/AnomalyTable";
 import GainsCurveChart from "../components/GainsCurveChart";
 import CusumChart from "../components/CusumChart";
+import DetectorComparisonTable from "../components/DetectorComparisonTable";
 import TransactionExplainPanel from "../components/TransactionExplainPanel";
 
 const PAGE_SIZE = 15;
@@ -18,6 +19,7 @@ export default function SpendPage() {
   const [explanation, setExplanation] = useState(null);
   const [driftEmployeeId, setDriftEmployeeId] = useState("1173");
   const [drift, setDrift] = useState(null);
+  const [comparison, setComparison] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -36,6 +38,7 @@ export default function SpendPage() {
   useEffect(() => {
     api.gainsCurve().then(setGainsCurve);
     api.alertFatigue().then((rows) => setAlertFatigue(rows[0]));
+    api.detectorComparison().then(setComparison);
   }, []);
 
   useEffect(() => {
@@ -130,6 +133,16 @@ export default function SpendPage() {
         </div>
       )}
 
+      <div className="card">
+        <h2>Detector comparison</h2>
+        <div className="card-sub">
+          Standalone precision/recall/PR-AUC per detector, broken out by anomaly type — not just the
+          ensemble. Reported as-is: CUSUM does not outperform the point-anomaly detectors on slow_drift
+          in this run.
+        </div>
+        <DetectorComparisonTable comparison={comparison} />
+      </div>
+
       <div className="grid-2">
         <div className="card">
           <h2>Dollar-weighted gains curve</h2>
@@ -149,6 +162,17 @@ export default function SpendPage() {
             />
           </div>
           <CusumChart drift={drift} />
+          {drift?.detection_timing && (
+            <p style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 10 }}>
+              Across all injected slow_drift cases: {drift.detection_timing.n_detected} of{" "}
+              {drift.detection_timing.n_total_cases} were ever detected by CUSUM (
+              {((drift.detection_timing.n_detected / drift.detection_timing.n_total_cases) * 100).toFixed(1)}%).
+              Of those detected, {(drift.detection_timing.pct_caught_during_active * 100).toFixed(0)}% were
+              caught while the drift was still active and{" "}
+              {(drift.detection_timing.pct_caught_after_ended * 100).toFixed(0)}% only after it had already
+              ended.
+            </p>
+          )}
         </div>
       </div>
     </div>

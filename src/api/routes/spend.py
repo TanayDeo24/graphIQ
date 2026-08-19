@@ -64,10 +64,29 @@ def drift(employee_id: Optional[int] = None, department_id: Optional[int] = None
 
     query = text(f"SELECT * FROM spend_cusum_series {where_sql} ORDER BY employee_id, merchant_category, month")
     df = pd.read_sql(query, engine, params=params)
+
+    timing_df = pd.read_sql("SELECT * FROM spend_drift_timing_summary", engine)
+    timing = timing_df.to_dict(orient="records")[0] if not timing_df.empty else None
+
     return {
         "control_limits": {"k_sigma": K_SIGMA, "h_sigma": H_SIGMA},
         "series": df.to_dict(orient="records"),
+        "detection_timing": timing,
     }
+
+
+@router.get("/detector-comparison")
+def detector_comparison():
+    """PR-AUC for each detector (Isolation Forest / autoencoder / CUSUM /
+    ensemble), broken out per anomaly type — the standalone comparison
+    that shows which detector is actually good at what, honestly."""
+    engine = get_engine()
+    df = pd.read_sql(
+        "SELECT detector, anomaly_type, metric_value FROM spend_eval_metrics WHERE metric_name = 'pr_auc'",
+        engine,
+    )
+    pivot = df.pivot_table(index="detector", columns="anomaly_type", values="metric_value").reset_index()
+    return pivot.to_dict(orient="records")
 
 
 @router.get("/alert-fatigue")

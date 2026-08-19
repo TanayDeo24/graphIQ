@@ -98,13 +98,17 @@ def dollar_weighted_gains_curve(scored: pd.DataFrame, score_col: str = "ensemble
 
 
 # ---------------------------------------------------------------------
-# 3. CUSUM drift detection delay with bootstrapped CI
+# 3. CUSUM drift detection delay with bootstrapped CI, plus whether each
+# detected case was caught while the drift was still active or only after
+# it had already ended (see drift_detection_timing() below).
 # ---------------------------------------------------------------------
 def cusum_drift_delay(scored: pd.DataFrame, monthly_cusum: pd.DataFrame) -> pd.DataFrame:
     drift_txns = scored[scored["anomaly_type"] == "slow_drift"]
-    cases = drift_txns.groupby(["employee_id", "merchant_category"])["transaction_date"].min().reset_index()
-    cases = cases.rename(columns={"transaction_date": "onset_date"})
+    onset = drift_txns.groupby(["employee_id", "merchant_category"])["transaction_date"].min()
+    end = drift_txns.groupby(["employee_id", "merchant_category"])["transaction_date"].max()
+    cases = pd.DataFrame({"onset_date": onset, "end_date": end}).reset_index()
     cases["onset_month"] = cases["onset_date"].dt.to_period("M").dt.to_timestamp()
+    cases["end_month"] = cases["end_date"].dt.to_period("M").dt.to_timestamp()
 
     rows = []
     for row in cases.itertuples(index=False):
@@ -117,19 +121,62 @@ def cusum_drift_delay(scored: pd.DataFrame, monthly_cusum: pd.DataFrame) -> pd.D
 
         flagged_month = candidates["month"].iloc[0] if not candidates.empty else None
         delay = None
+        caught_during_active_window = None
         if flagged_month is not None:
             delay = int(round((flagged_month.year - row.onset_month.year) * 12 + (flagged_month.month - row.onset_month.month)))
+            caught_during_active_window = bool(flagged_month <= row.end_month)
 
         rows.append(
             {
                 "employee_id": row.employee_id,
                 "merchant_category": row.merchant_category,
                 "onset_month": row.onset_month,
+                "end_month": row.end_month,
                 "flagged_month": flagged_month,
                 "delay_months": delay,
+                "caught_during_active_window": caught_during_active_window,
             }
         )
     return pd.DataFrame(rows)
+
+
+def drift_detection_timing(drift_delay_df: pd.DataFrame) -> dict:
+    """Honest complement to the delay mean/median: of the slow_drift cases
+    CUSUM actually caught, what fraction were caught while the drift was
+    still active vs. only after it had already ended (i.e. the delay was
+    longer than the drift's own 4-8 month duration)? Framing this only as
+    a mean delay number can look better than it is if a large share of
+    "successful" detections actually landed after the drift was already
+    over."""
+    n_total = len(drift_delay_df)
+    detected = drift_delay_df[drift_delay_df["flagged_month"].notna()]
+    n_detected = len(detected)
+    n_undetected = n_total - n_detected
+
+    n_during = int(detected["caught_during_active_window"].sum()) if n_detected else 0
+    n_after = n_detected - n_during
+
+    return {
+        "n_total_cases": n_total,
+        "n_detected": n_detected,
+        "n_undetected": n_undetected,
+        "n_caught_during_active": n_during,
+        "n_caught_after_ended": n_after,
+        "pct_caught_during_active": (n_during / n_detected) if n_detected else float("nan"),
+        "pct_caught_after_ended": (n_after / n_detected) if n_detected else float("nan"),
+    }
+
+
+# ---------------------------------------------------------------------
+# Detector comparison table: rows = detector, columns = anomaly type,
+# cells = PR-AUC. The actual interesting result from Problem 2's fix —
+# whether CUSUM helps at all, honestly, not assumed.
+# ---------------------------------------------------------------------
+def detector_comparison_table(eval_metrics_df: pd.DataFrame) -> pd.DataFrame:
+    pr_auc_rows = eval_metrics_df[eval_metrics_df["metric_name"] == "pr_auc"]
+    pivot = pr_auc_rows.pivot_table(index="detector", columns="anomaly_type", values="metric_value")
+    ordered_cols = [c for c in ANOMALY_TYPES + ["overall"] if c in pivot.columns]
+    return pivot[ordered_cols].reset_index()
 
 
 def bootstrap_ci(values: np.ndarray, statistic_fn, n_bootstrap=N_BOOTSTRAP, seed=RNG_SEED) -> tuple:
@@ -272,6 +319,9 @@ def run():
     eval_metrics_df = eval_metrics_df[["detector", "anomaly_type", "metric_name", "metric_value"]]
     eval_metrics_df.to_csv(os.path.join(OUT_DIR, "eval_metrics_by_type.csv"), index=False)
 
+    comparison_df = detector_comparison_table(eval_metrics_df)
+    comparison_df.to_csv(os.path.join(OUT_DIR, "detector_comparison_pr_auc.csv"), index=False)
+
     # --- 2. gains curve ---
     gains_df = dollar_weighted_gains_curve(scored)
     gains_df.to_csv(os.path.join(OUT_DIR, "gains_curve.csv"), index=False)
@@ -300,6 +350,10 @@ def run():
         )
     drift_summary_df = pd.DataFrame(drift_summary_rows)
     drift_summary_df.to_csv(os.path.join(OUT_DIR, "drift_delay_summary.csv"), index=False)
+
+    timing = drift_detection_timing(drift_delay_df)
+    timing_df = pd.DataFrame([timing])
+    timing_df.to_csv(os.path.join(OUT_DIR, "drift_detection_timing.csv"), index=False)
 
     # --- 4. alert fatigue ---
     fatigue = alert_fatigue(scored, threshold)
@@ -339,6 +393,7 @@ def run():
     drift_delay_db = drift_delay_df.dropna(subset=["employee_id"]).copy()
     _write_table(engine, drift_delay_db, "spend_drift_delay")
     _write_table(engine, drift_summary_df, "spend_drift_delay_summary")
+    _write_table(engine, timing_df, "spend_drift_timing_summary")
 
     emp_dept = scored[["employee_id", "department_id"]].drop_duplicates()
     cusum_series_db = monthly_cusum.merge(emp_dept, on="employee_id", how="left")
@@ -361,7 +416,14 @@ def run():
     print("Spend evaluation complete.")
     print(headline)
     print(fatigue)
-    return {"headline": headline, "alert_fatigue": fatigue}
+    print("Detector comparison (PR-AUC):")
+    print(comparison_df.to_string(index=False))
+    print(
+        f"Drift timing: {timing['n_detected']}/{timing['n_total_cases']} slow_drift cases detected; "
+        f"of those, {timing['pct_caught_during_active']:.0%} caught while still active, "
+        f"{timing['pct_caught_after_ended']:.0%} only caught after the drift had already ended."
+    )
+    return {"headline": headline, "alert_fatigue": fatigue, "drift_timing": timing}
 
 
 if __name__ == "__main__":

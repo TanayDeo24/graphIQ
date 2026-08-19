@@ -149,12 +149,14 @@ CREATE INDEX IF NOT EXISTS idx_spend_cusum_series_employee_id ON spend_cusum_ser
 CREATE INDEX IF NOT EXISTS idx_spend_cusum_series_department_id ON spend_cusum_series(department_id);
 
 CREATE TABLE IF NOT EXISTS spend_drift_delay (
-    id              SERIAL PRIMARY KEY,
-    employee_id      INTEGER NOT NULL REFERENCES employees(employee_id),
-    merchant_category TEXT NOT NULL,
-    onset_month       DATE NOT NULL,
-    flagged_month      DATE,
-    delay_months       INTEGER
+    id                          SERIAL PRIMARY KEY,
+    employee_id                  INTEGER NOT NULL REFERENCES employees(employee_id),
+    merchant_category             TEXT NOT NULL,
+    onset_month                   DATE NOT NULL,
+    end_month                     DATE NOT NULL,   -- last month of the injected drift's active window
+    flagged_month                  DATE,
+    delay_months                   INTEGER,
+    caught_during_active_window      BOOLEAN         -- NULL if never flagged; else flagged_month <= end_month
 );
 
 CREATE TABLE IF NOT EXISTS spend_drift_delay_summary (
@@ -165,6 +167,20 @@ CREATE TABLE IF NOT EXISTS spend_drift_delay_summary (
     ci_high        DOUBLE PRECISION NOT NULL,
     n_bootstrap      INTEGER NOT NULL,
     n_cases         INTEGER NOT NULL
+);
+
+-- Complements spend_drift_delay_summary's delay statistic with the honest
+-- "caught while still drifting vs. only caught after it already ended" split
+-- (see src/models/spend/evaluate.py's drift_detection_timing()).
+CREATE TABLE IF NOT EXISTS spend_drift_timing_summary (
+    id                        SERIAL PRIMARY KEY,
+    n_total_cases                INTEGER NOT NULL,
+    n_detected                  INTEGER NOT NULL,
+    n_undetected                 INTEGER NOT NULL,
+    n_caught_during_active         INTEGER NOT NULL,
+    n_caught_after_ended           INTEGER NOT NULL,
+    pct_caught_during_active       DOUBLE PRECISION NOT NULL,  -- of DETECTED cases only
+    pct_caught_after_ended         DOUBLE PRECISION NOT NULL   -- of DETECTED cases only
 );
 
 CREATE TABLE IF NOT EXISTS spend_alert_fatigue (

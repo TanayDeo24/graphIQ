@@ -15,6 +15,7 @@ export const api = {
   gainsCurve: () => client.get("/api/spend/gains-curve").then((r) => r.data),
   drift: (params) => client.get("/api/spend/drift", { params }).then((r) => r.data),
   alertFatigue: () => client.get("/api/spend/alert-fatigue").then((r) => r.data),
+  detectorComparison: () => client.get("/api/spend/detector-comparison").then((r) => r.data),
   explainTransaction: (transactionId) =>
     client.get(`/api/spend/transaction/${transactionId}/explain`).then((r) => r.data),
 };
