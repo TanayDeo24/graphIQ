@@ -82,6 +82,18 @@ Key generation choices (each documented in-line in the source):
   flags unintended correlations; see
   [`data/generated/validation_report.md`](data/generated/validation_report.md)
   after running the generation step.
+- **`duration_months` (attrition survival target) is month-level-resolution,
+  not the real dataset's own resolution.** The real `YearsAtCompany` field is
+  annual-resolution only (integer years) — using it directly (`tenure_years *
+  12`) gave only ~37 distinct duration values across 1,470 employees, heavy
+  ties that degenerated the lead-time metric to a median of 0 months and made
+  the four 30/60/90/180-day AUC horizons numerically identical.
+  `assign_fine_grained_duration()` in `attrition_extension.py` derives a
+  disclosed, reproducible month-level value instead, anchored to each
+  employee's own already-generated `comp_history` timeline (196 distinct
+  values after the fix). The real annual value is never overwritten — it
+  stays available as `tenure_years` throughout. See the "Attrition" results
+  section below for what this fix did and did not resolve.
 
 ## Honesty / scope disclaimer
 
@@ -168,44 +180,88 @@ CI, per-segment calibration row, and per-transaction explanation).
 
 | Metric | Value |
 |---|---|
-| Cox PH concordance index | 0.966 |
-| GBM survival concordance index | 0.909 |
-| GBM integrated Brier score | 0.067 |
-| GBM mean time-dependent AUC (~1/2/3/6mo horizons) | 0.780 |
+| Cox PH concordance index | 0.964 |
+| GBM survival concordance index | 0.921 |
+| GBM integrated Brier score | 0.091 |
+| GBM time-dependent AUC: 30d / 60d / 90d / 180d | 0.916 / 0.954 / 0.952 / 0.967 |
+| GBM mean time-dependent AUC | 0.959 |
 | PH assumption violations (Schoenfeld residual test, p<0.05) | none |
-| Lead time, true positives: mean | 1.7 months (95% CI 0.8–2.7, n=86) |
-| Lead time, true positives: median | 0.0 months (95% CI 0.0–0.0, n=86) |
-| Counterfactual sensitivity (simulated +10% income, GBM) | mean risk-score change −2.8%; 42% of the high-risk sample decreased, correlational only |
+| Lead time, true positives: mean | 3.4 months (95% CI 2.7–4.0, n=84) |
+| Lead time, true positives: median | 3.0 months (95% CI 1.5–4.0, n=84) |
+| Distinct `duration_months` values (1,470 employees) | 37 → 196 after the fine-graining fix |
+| Counterfactual sensitivity (simulated +10% income, GBM) | mean risk-score change −1.2%; 32% of the high-risk sample decreased, correlational only |
 
-The four nominal 30/60/90/180-day AUC horizons come out numerically identical
-in this run — a real, expected consequence of `duration_months` being derived
-from the real dataset's integer-year `YearsAtCompany` field (values only ever
-land on multiples of 12), not a computation bug. See the docstring on
-`time_dependent_auc()` in `src/models/attrition/evaluate.py` for the full
-explanation, including why a strict tenure-length train/test partition (as a
-literal reading of the build spec's split description) turned out to be
-mathematically incompatible with IPCW-based metrics, and the standard
-rolling-origin design used instead.
+**What the duration-granularity fix actually resolved, and what it didn't —
+reported honestly, not adjusted to look better:**
+
+- **Resolved:** the four AUC horizons are now genuinely distinct values
+  (0.916 / 0.954 / 0.952 / 0.967), not the identical number reported before.
+  This was a real consequence of annual-only duration ties and is fixed.
+- **Resolved:** the lead-time distribution is no longer degenerate. Median
+  went from 0.0 months (95% CI 0.0–0.0, meaningless) to 3.0 months (95% CI
+  1.5–4.0, a real distribution — see the histogram on the dashboard).
+- **Not resolved, and this fix could not have resolved it:** concordance and
+  AUC remain implausibly high relative to published real-world attrition
+  C-index literature (typically 0.65–0.80) — Cox barely moved (0.966 → 0.964)
+  and GBM's concordance and integrated Brier score both got *worse*
+  (0.909 → 0.921 concordance; 0.067 → 0.091 IBS, higher is worse) after the
+  fix, not better. Investigating why turned up the actual cause: **`features.py`
+  sets `tenure_months = duration_months` (line 81) and includes `tenure_months`
+  in the model's own input feature set (line 18)** — both survival models are
+  trained with a copy of their own prediction target as an input feature. That
+  is direct label leakage, and it fully explains the implausible discrimination
+  regardless of duration granularity; fine-graining the leaked value made the
+  leak *more* precise (fewer ties diluting it), which is why GBM's numbers got
+  slightly worse, not better, after the fix. This is a separate, pre-existing
+  bug, out of scope for the two problems this fix request diagnosed — it is
+  **not fixed here** and is flagged as the clear next thing to fix
+  (`src/models/attrition/features.py:81` and `:18`).
 
 ### Spend (anomaly detection)
 
 | Metric | Value |
 |---|---|
 | Ensemble precision / recall / PR-AUC (overall, 5% injection) | 33.7% / 33.6% / 0.317 |
-| Isolation Forest PR-AUC, `point_spike` | 0.90+ |
-| Isolation Forest / autoencoder PR-AUC, `slow_drift` and `coordinated_pattern` | ~0.02–0.05 |
 | Top 10% of alerts capture (dollar-weighted gains) | 79.2% of flagged dollar volume |
 | Alerts per 1,000 transactions (operating threshold) | 50.0 |
-| CUSUM drift detection delay: mean | 7.3 months (95% CI 4.3–10.7, n=15 cases) |
-| CUSUM drift detection delay: median | 5.0 months (95% CI 4.0–9.0, n=15 cases) |
-| Robustness (1%/5%/10% injection) | point_spike PR-AUC stable ~0.46–0.59; slow_drift/coordinated stay low across all three rates |
+| CUSUM drift detection delay: mean | 7.3 months (95% CI 4.3–10.7, n=15 detected cases) |
+| CUSUM drift detection delay: median | 5.0 months (95% CI 4.0–9.0, n=15 detected cases) |
+| `slow_drift` cases ever detected by CUSUM | 15 of 579 (2.6%) |
+| Of those detected: caught while still active / only after it ended | 73% / 27% |
+| Robustness (1%/5%/10% injection) | `point_spike` PR-AUC stable ~0.46–0.59 across all three rates; `slow_drift`/`coordinated_pattern` stay low at every rate for every detector, CUSUM included |
 
-The gap between `point_spike` (well-detected by point-anomaly detectors) and
-`slow_drift`/`coordinated_pattern` (poorly detected by the same detectors) is
-the intended result, not a shortcoming: it's exactly what motivates including
-a CUSUM drift detector alongside Isolation Forest and the autoencoder — a
-point-anomaly detector is structurally incapable of catching a drift that's
-invisible in any single transaction.
+**Standalone PR-AUC per detector, per anomaly type** (not just the ensemble —
+the comparison table this fix request asked for, and the actual interesting
+result; also live on the dashboard's Spend page):
+
+| Detector | `point_spike` | `slow_drift` | `coordinated_pattern` | overall |
+|---|---|---|---|---|
+| Isolation Forest | 0.896 | 0.028 | 0.039 | 0.417 |
+| Autoencoder | 0.863 | **0.051** | 0.080 | 0.464 |
+| CUSUM | 0.068 | 0.021 | 0.018 | 0.084 |
+| Ensemble | 0.588 | 0.032 | 0.038 | 0.317 |
+
+**This does not support the "CUSUM catches what point detectors structurally
+can't" framing this project originally shipped with, and that framing has
+been removed rather than kept.** Reported plainly: CUSUM's own standalone
+`slow_drift` PR-AUC (0.021) is the *lowest* of all four detectors — including
+Isolation Forest (0.028) and the autoencoder (0.051), the two detectors it
+was specifically meant to outperform on this anomaly type. The autoencoder is
+actually the best standalone `slow_drift` detector in this run. CUSUM's
+overall PR-AUC (0.084) is also the worst of the four. Beyond precision/recall,
+CUSUM only ever flags 15 of the 579 injected `slow_drift` cases at all
+(2.6%) — the other 564 are never detected by CUSUM regardless of delay. Of
+the 15 it does catch, 27% are only caught after the drift has already ended
+(the mean 7.3-month delay is close to or longer than the injected drift's own
+4–8 month duration), which undercuts the "catches it early" framing on its
+own terms even before the detection-rate problem.
+
+None of the CUSUM tuning (`k=0.5σ`, `h=5σ` in `cusum.py`) was adjusted to
+produce a better-looking number here — these are the results of the existing,
+documented Western-Electric-style tuning, reported as measured. A real fix
+would need to revisit either the CUSUM tuning itself, the `slow_drift`
+injection parameters (see `spend_generator.py`'s `SLOW_DRIFT_TOTAL_INCREASE_RANGE`),
+or both — that investigation is out of scope for this fix request.
 
 ## Repository layout
 
