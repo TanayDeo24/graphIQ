@@ -35,6 +35,13 @@ from src.generation.spend_generator import (
 
 DIST_FLAG_THRESHOLD = 0.15
 CORR_FLAG_THRESHOLD = 0.30
+# "Still too coarse" flag threshold for distinct duration_months values. Roughly
+# half of 1,470 employees / 12 months-per-year = ~61, i.e. the number you'd expect
+# if durations spread only about half as evenly as a full independent-per-month
+# distribution would give across a realistic tenure range — a conservative floor
+# for "meaningfully more resolution than the annual-only original", not a claim
+# about any theoretically ideal count.
+MIN_DISTINCT_DURATION_MONTHS = 60
 
 
 def check_category_distributions(transactions_path: str) -> list:
@@ -89,6 +96,22 @@ def check_concentration(transactions_path: str, employees_path: str) -> dict:
     }
 
 
+def check_duration_granularity(employees_path: str) -> dict:
+    """Compare distinct duration_months values before (tenure_years * 12,
+    the coarse annual-only approach previously used, kept here only for
+    comparison — no longer used downstream) vs. after (the fine-grained,
+    timeline-anchored value actually generated — see
+    assign_fine_grained_duration() in attrition_extension.py)."""
+    df = pd.read_csv(employees_path)
+    before = int((df["tenure_years"] * 12).nunique())
+    after = int(df["duration_months"].nunique())
+    return {
+        "distinct_duration_before": before,
+        "distinct_duration_after": after,
+        "still_too_coarse": after < MIN_DISTINCT_DURATION_MONTHS,
+    }
+
+
 def perturbation_sensitivity(employees_path: str, rng_seed: int = 999) -> dict:
     employees = pd.read_csv(employees_path)
     rng = np.random.default_rng(rng_seed)
@@ -138,6 +161,7 @@ def build_report(out_dir: str, employees_path: str, transactions_path: str) -> s
     dist_findings = check_category_distributions(transactions_path)
     concentration = check_concentration(transactions_path, employees_path)
     perturbation = perturbation_sensitivity(employees_path)
+    duration_granularity = check_duration_granularity(employees_path)
 
     lines = ["# Synthetic Data Validation Report", ""]
 
@@ -203,6 +227,30 @@ def build_report(out_dir: str, employees_path: str, transactions_path: str) -> s
         "module docstring above for why the model-eval-level version of this question is answered separately by "
         "the 1%/5%/10% injection-rate robustness comparison in src/models/spend/evaluate.py."
     )
+    lines.append("")
+
+    lines.append("## 4. Duration granularity (attrition survival target)")
+    lines.append("")
+    lines.append(
+        "The real IBM dataset's YearsAtCompany is annual-resolution only. duration_months is a disclosed "
+        "synthetic refinement (see assign_fine_grained_duration() in attrition_extension.py), anchored to each "
+        "employee's own generated comp_history timeline rather than an independent random draw."
+    )
+    lines.append(
+        f"- Distinct duration_months values, before (tenure_years * 12, no longer used downstream): "
+        f"{duration_granularity['distinct_duration_before']}"
+    )
+    lines.append(
+        f"- Distinct duration_months values, after (fine-grained, timeline-anchored): "
+        f"{duration_granularity['distinct_duration_after']}"
+    )
+    if duration_granularity["still_too_coarse"]:
+        lines.append(
+            f"- **FLAGGED:** still under the {MIN_DISTINCT_DURATION_MONTHS}-distinct-value threshold "
+            "considered meaningfully improved over the annual-only original."
+        )
+    else:
+        lines.append(f"- Above the {MIN_DISTINCT_DURATION_MONTHS}-distinct-value threshold — not flagged.")
     lines.append("")
 
     report = "\n".join(lines)

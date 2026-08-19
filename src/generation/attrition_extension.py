@@ -34,6 +34,17 @@ numbers to the implementation):
   concentrates short-tenure (higher base-rate attrition) employees in
   train and long-tenure employees in test, which is a harder and more
   realistic generalization test than a random 80/20 split.
+- Duration granularity (`duration_months`): the real IBM dataset's
+  `YearsAtCompany` is annual-resolution only (integer years), which
+  produces heavy ties in the survival ranking task if used directly as
+  `tenure_years * 12` — see `assign_fine_grained_duration()` below and
+  `validate_synthetic.py`'s distinct-duration-value check. `duration_months`
+  is therefore a disclosed synthetic refinement, giving month-level
+  precision the real dataset doesn't actually contain, derived from each
+  employee's own already-generated comp_history/performance_reviews
+  timeline rather than an independent random draw. The real annual value
+  is never overwritten or hidden — it stays available as `tenure_years`
+  throughout (unmodified IBM `YearsAtCompany`).
 """
 
 import glob
@@ -115,6 +126,10 @@ def load_employees(raw_dir: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"IBM dataset is missing expected columns after rename: {missing}")
 
+    # Placeholder, coarse value (tenure_years * 12) — used only for sizing each
+    # employee's synthetic history window in generate_all(). Overwritten there
+    # with the month-level-resolution value (see assign_fine_grained_duration)
+    # before this column is ever written out or used as a modeling target.
     df["duration_months"] = df["tenure_years"] * 12
     df["event_observed"] = df["attrition_flag"].eq("Yes")
     return df
@@ -145,6 +160,71 @@ def _tenure_band(tenure_years: float) -> str:
 def _sample_raise_pct(rng: np.random.Generator) -> float:
     a = (0.0 - RAISE_PCT_MEAN) / RAISE_PCT_STD
     return float(truncnorm.rvs(a, np.inf, loc=RAISE_PCT_MEAN, scale=RAISE_PCT_STD, random_state=rng))
+
+
+def _comp_history_offsets(comp_history_df: pd.DataFrame) -> list:
+    return [
+        (d.year - WINDOW_START.year) * 12 + (d.month - WINDOW_START.month)
+        for d in comp_history_df["effective_month"]
+    ]
+
+
+def assign_fine_grained_duration(
+    tenure_years: int,
+    comp_history_df: pd.DataFrame,
+    employee_id: int,
+) -> int:
+    """Derive a month-level-resolution duration_months from this employee's
+    own already-generated 36-month synthetic timeline, anchored to their
+    last comp_history event — not an independent random draw.
+
+    Real-world caveat, stated plainly: this does NOT recover the
+    employee's actual real-world month of departure/last-observation —
+    the real IBM dataset simply doesn't contain that information (only
+    annual-resolution YearsAtCompany). What this produces is a
+    reproducible, timeline-anchored month-level value that breaks the
+    heavy ties an annual-only duration would otherwise create in the
+    survival ranking task, while staying internally consistent with each
+    employee's own generated events.
+
+    Anchored to comp_history specifically, not performance_reviews: a
+    review's *timing* follows a fixed, unjittered 6-month schedule (only
+    its score is random), so when it happens to be an employee's latest
+    event it collapses every employee sharing the same window length to
+    the identical anchor month — exactly the tie problem this function
+    exists to fix. comp_history raise/promotion timing carries real
+    per-employee jitter (see generate_comp_history_for_employee), so it's
+    used as the anchor's month component; the exact dollar amount at that
+    event (itself a deterministic function of this employee's own
+    randomly-sampled raise percentage) breaks residual ties within the
+    same clamped month, so two employees who both land on "month 11" by
+    jitter alone still get distinct spread from a genuinely-varying,
+    timeline-derived value rather than an arbitrary independent draw.
+
+    Falls back to a per-employee seeded draw only when comp_history has no
+    variation to anchor to at all — i.e. tenure_years == 0, whose 1-month
+    window contains just the single 'initial' row.
+
+    For tenure_years == 0, duration_months = month_within_final_year - 1,
+    i.e. somewhere in [0, 11] ("year 0" = less than one full year).
+    For tenure_years >= 1, duration_months = (tenure_years - 1) * 12 +
+    month_within_final_year, i.e. somewhere in the employee's reported
+    final year of tenure.
+    """
+    comp_offsets = _comp_history_offsets(comp_history_df)
+
+    if len(set(comp_offsets)) > 1:
+        last_offset = max(comp_offsets)
+        last_income = float(comp_history_df["monthly_income"].iloc[-1])
+        income_cents = int(round(last_income * 100))
+        month_within_final_year = ((last_offset * 97 + income_cents) % 12) + 1
+    else:
+        rng = np.random.default_rng(SEED + employee_id)
+        month_within_final_year = int(rng.integers(1, 13))
+
+    if tenure_years <= 0:
+        return month_within_final_year - 1
+    return (tenure_years - 1) * 12 + month_within_final_year
 
 
 def generate_comp_history_for_employee(
@@ -279,24 +359,31 @@ def generate_all(raw_dir: str, out_dir: str) -> dict:
     comp_history_frames = []
     performance_frames = []
     benefits_rows = []
+    fine_grained_durations = []
 
     for row in employees.itertuples(index=False):
+        # Window sizing uses the coarse tenure_years * 12 value (how much history to
+        # synthesize is a separate concern from the survival target's precision) — see
+        # assign_fine_grained_duration() below, which derives the actual duration_months
+        # used for modeling from the events generated here, after they're generated.
         window_len = window_length_months(row.duration_months)
         band_avg = tenure_band_avg_job_level.get(_tenure_band(row.tenure_years), employees["job_level"].mean())
         is_above_band_avg = row.job_level > band_avg
         promotion_prob = 0.60 if is_above_band_avg else 0.15
         is_promoted = bool(rng.random() < promotion_prob)
 
-        comp_history_frames.append(
-            generate_comp_history_for_employee(
-                row.employee_id, float(row.monthly_income), window_len, is_promoted, rng
-            )
+        comp_history_df = generate_comp_history_for_employee(
+            row.employee_id, float(row.monthly_income), window_len, is_promoted, rng
         )
-        performance_frames.append(
-            generate_performance_reviews_for_employee(
-                row.employee_id, int(row.performance_rating), window_len, rng
-            )
+        performance_df = generate_performance_reviews_for_employee(
+            row.employee_id, int(row.performance_rating), window_len, rng
         )
+        comp_history_frames.append(comp_history_df)
+        performance_frames.append(performance_df)
+        fine_grained_durations.append(
+            assign_fine_grained_duration(int(row.tenure_years), comp_history_df, row.employee_id)
+        )
+
         benefits_rows.append(
             {
                 "employee_id": row.employee_id,
@@ -313,6 +400,9 @@ def generate_all(raw_dir: str, out_dir: str) -> dict:
     )
     benefits_enrollment = pd.DataFrame(benefits_rows)
 
+    # Replace the coarse (tenure_years * 12) duration used for window sizing above with
+    # the month-level-resolution value used as the actual survival modeling target.
+    employees["duration_months"] = fine_grained_durations
     employees["data_split"] = employees["duration_months"].apply(assign_temporal_split)
 
     employees.to_csv(os.path.join(out_dir, "employees.csv"), index=False)
