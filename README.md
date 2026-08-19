@@ -180,42 +180,80 @@ CI, per-segment calibration row, and per-transaction explanation).
 
 | Metric | Value |
 |---|---|
-| Cox PH concordance index | 0.964 |
-| GBM survival concordance index | 0.921 |
-| GBM integrated Brier score | 0.091 |
-| GBM time-dependent AUC: 30d / 60d / 90d / 180d | 0.916 / 0.954 / 0.952 / 0.967 |
-| GBM mean time-dependent AUC | 0.959 |
-| PH assumption violations (Schoenfeld residual test, p<0.05) | none |
-| Lead time, true positives: mean | 3.4 months (95% CI 2.7–4.0, n=84) |
-| Lead time, true positives: median | 3.0 months (95% CI 1.5–4.0, n=84) |
-| Distinct `duration_months` values (1,470 employees) | 37 → 196 after the fine-graining fix |
-| Counterfactual sensitivity (simulated +10% income, GBM) | mean risk-score change −1.2%; 32% of the high-risk sample decreased, correlational only |
+| Cox PH concordance index (overall) | 0.944 |
+| GBM survival concordance index (overall) | 0.958 |
+| **Cox within-tenure-band concordance** | **0.783** |
+| **GBM within-tenure-band concordance** | **0.830** |
+| GBM integrated Brier score | 0.113 |
+| GBM time-dependent AUC: 30d / 60d / 90d / 180d | 0.829 / 0.816 / 0.750 / 0.830 |
+| GBM mean time-dependent AUC | 0.816 |
+| PH assumption violations (Schoenfeld residual test, p<0.05) | `baseline_tenure_band_2-5` (p=6.8e-05) — see below |
+| Lead time, true positives: mean | 2.6 months (95% CI 1.8–3.4, n=51) |
+| Lead time, true positives: median | 2.0 months (95% CI 0.0–4.0, n=51) |
+| Counterfactual sensitivity (simulated +10% income, GBM) | mean risk-score change +5.2%; 37% of the high-risk sample decreased, correlational only |
 
-**What the duration-granularity fix actually resolved, and what it didn't —
-reported honestly, not adjusted to look better:**
+**The label leak (`tenure_months = duration_months`, fed to both models as
+an input feature) is fixed.** `features.py` no longer contains it, every
+remaining feature carries a one-line legitimacy justification, and an
+automated guardrail (`check_no_leakage()`, run at the start of every
+evaluation) fails the run if any feature exceeds 0.95 correlation with the
+survival target. Two other features turned out to need the same fix in a
+softer form during the audit — `num_raises` and `review_score_trend` were
+being computed over an employee's *entire* generated window, whose length is
+itself a near-deterministic function of tenure; both are now computed over a
+fixed 12-month baseline slice at the start of the window instead, so every
+employee is measured over the same lookback regardless of total tenure. A
+tenure covariate is still used (the original design intent), but as a coarse
+0-2/2-5/5+ year band from the real `tenure_years` field, not an exact month
+count — see `_baseline_tenure_band()`'s docstring for why an exact-month
+version of this same feature (tenure already accrued before the window
+began) still failed the guardrail at 0.99 correlation despite not being
+computed from `duration_months` at all.
 
-- **Resolved:** the four AUC horizons are now genuinely distinct values
-  (0.916 / 0.954 / 0.952 / 0.967), not the identical number reported before.
-  This was a real consequence of annual-only duration ties and is fixed.
-- **Resolved:** the lead-time distribution is no longer degenerate. Median
-  went from 0.0 months (95% CI 0.0–0.0, meaningless) to 3.0 months (95% CI
-  1.5–4.0, a real distribution — see the histogram on the dashboard).
-- **Not resolved, and this fix could not have resolved it:** concordance and
-  AUC remain implausibly high relative to published real-world attrition
-  C-index literature (typically 0.65–0.80) — Cox barely moved (0.966 → 0.964)
-  and GBM's concordance and integrated Brier score both got *worse*
-  (0.909 → 0.921 concordance; 0.067 → 0.091 IBS, higher is worse) after the
-  fix, not better. Investigating why turned up the actual cause: **`features.py`
-  sets `tenure_months = duration_months` (line 81) and includes `tenure_months`
-  in the model's own input feature set (line 18)** — both survival models are
-  trained with a copy of their own prediction target as an input feature. That
-  is direct label leakage, and it fully explains the implausible discrimination
-  regardless of duration granularity; fine-graining the leaked value made the
-  leak *more* precise (fewer ties diluting it), which is why GBM's numbers got
-  slightly worse, not better, after the fix. This is a separate, pre-existing
-  bug, out of scope for the two problems this fix request diagnosed — it is
-  **not fixed here** and is flagged as the clear next thing to fix
-  (`src/models/attrition/features.py:81` and `:18`).
+**Overall concordance and AUC stayed high after the leak was removed — Cox
+barely moved (0.964 → 0.944) and GBM went *up*, not down (0.921 → 0.958,
+IBS got worse: 0.091 → 0.113). Fixing the known bug did not, on its own, make
+the numbers trustworthy, and this project is not treating it as if it did.**
+Investigating turned up a second, structural (not a coding-bug) reason:
+`duration_months` is built as `(tenure_years - 1) * 12 +
+month_within_final_year` — a between-year spread of up to ~470 months against
+only ~12 months of within-year noise, so it's algebraically dominated by real
+`tenure_years`. Every legitimate covariate in the feature set (`job_level`,
+`monthly_income`, `baseline_tenure_band`) is itself naturally correlated with
+`tenure_years` through ordinary career progression (promotions and raises
+accumulate with time) — none of them individually exceeds the 0.95 leakage
+threshold, but a flexible model combining several moderately-correlated
+covariates can still reconstruct most of the *between-year* ranking that
+dominates concordance, without any single feature ever looking like a copy
+of the target. That's a property of how the survival target itself is
+constructed from real tenure data, not a feature-engineering bug, and it
+isn't fixable by further feature changes within this component.
+
+To get a fairer read, `within_tenure_band_concordance()` computes concordance
+*separately within* each real tenure band (0-2 / 2-5 / 5+ years) and pools
+the event-weighted result — i.e. "among people who've already been here about
+the same length of time, can the model tell who's likelier to leave sooner,"
+which strips out the "the model just knows roughly how long you've been
+here" component. That number is **0.783 (Cox) / 0.830 (GBM)** — squarely in
+the 0.65–0.80 range typical of published real-world attrition models (GBM
+sits slightly above it). This is reported as the more honest headline
+number for this component; the overall concordance/AUC figures above are
+kept in the table for transparency but should be read with the structural
+caveat above, not as this project's real claim about model quality. Full
+per-band breakdown (n, event count, concordance) is in
+`data/generated/attrition_outputs/within_tenure_band_concordance.csv`.
+
+One more honest side effect worth flagging rather than glossing over: the PH
+assumption check, run for the first time against features that actually
+carry real signal, now shows a genuine violation
+(`baseline_tenure_band_2-5`, p=6.8e-05) — the previous "PH assumption
+violations: none" was itself likely an artifact of `tenure_months`
+dominating the fit so completely that no other covariate's effect had room
+to show as non-proportional. A violation here means Cox's constant-hazard-
+ratio assumption doesn't strictly hold for this covariate; not fixed as part
+of this request (a stratified or time-varying-coefficient Cox model would be
+the standard next step), flagged for the same reason everything else in this
+section is.
 
 ### Spend (anomaly detection)
 

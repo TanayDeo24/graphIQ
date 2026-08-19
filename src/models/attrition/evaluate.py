@@ -23,7 +23,7 @@ from sqlalchemy import text
 
 from src.db.connection import get_engine
 from src.models.attrition import cox_model, gbm_survival
-from src.models.attrition.features import build_feature_frame, encode_features
+from src.models.attrition.features import build_feature_frame, check_no_leakage, encode_features
 
 OUT_DIR = "data/generated/attrition_outputs"
 N_BOOTSTRAP = 1000
@@ -76,6 +76,46 @@ def concordance(event_observed, duration_months, risk_score) -> float:
         event_observed.astype(bool), duration_months.astype(float), risk_score.astype(float)
     )
     return float(result[0])
+
+
+def within_tenure_band_concordance(event_observed, duration_months, risk_score, tenure_years) -> dict:
+    """Concordance computed separately within each real tenure_years band,
+    then pooled (event-count-weighted). Diagnostic added after the
+    feature-leakage fix: duration_months is built as
+    (tenure_years - 1) * 12 + month_within_final_year (see
+    attrition_extension.assign_fine_grained_duration) -- a between-year
+    spread of up to ~470 months against only ~12 months of within-year
+    noise, so duration_months is algebraically dominated by tenure_years.
+    Any feature even moderately correlated with tenure_years (job_level,
+    monthly_income, benefits_tier all are, through ordinary real-world
+    career progression -- none of them individually or literally leaked)
+    lets a flexible model reconstruct most of that between-year ranking
+    without any single feature ever looking like a copy of the target.
+    Overall concordance is structurally inflated by that regardless of
+    whether the feature set is clean. This metric asks the fairer
+    question instead: among people who've already been there about the
+    same length of time, can the model tell who's more likely to leave
+    sooner? That's the part of the ranking task that isn't just "does the
+    model know how long you've been here already."
+    """
+    band = pd.Series(tenure_years).apply(_tenure_band)
+    df = pd.DataFrame(
+        {"event_observed": event_observed, "duration_months": duration_months, "risk_score": risk_score, "band": band.values}
+    )
+    rows = []
+    weighted_sum, weight_total = 0.0, 0
+    for band_name, group in df.groupby("band"):
+        n_events = int(group["event_observed"].sum())
+        if n_events < 2 or len(group) < 5:
+            rows.append({"tenure_band": band_name, "n": len(group), "n_events": n_events, "concordance": None})
+            continue
+        c = concordance(group["event_observed"].values, group["duration_months"].values, group["risk_score"].values)
+        rows.append({"tenure_band": band_name, "n": len(group), "n_events": n_events, "concordance": c})
+        weighted_sum += c * n_events
+        weight_total += n_events
+
+    pooled = (weighted_sum / weight_total) if weight_total > 0 else float("nan")
+    return {"by_band": rows, "pooled": pooled, "n_events_pooled": weight_total}
 
 
 # ---------------------------------------------------------------------
@@ -177,7 +217,7 @@ def _calibration_rows_for_dimension(df: pd.DataFrame, dimension_name: str, group
 def segment_calibration(test_df: pd.DataFrame, predicted_survival_12m: np.ndarray) -> pd.DataFrame:
     df = test_df.copy()
     df["predicted_survival_12m"] = predicted_survival_12m
-    df["tenure_band"] = (df["tenure_months"] / 12).apply(_tenure_band)
+    df["tenure_band"] = df["tenure_years"].apply(_tenure_band)
     df["comp_band"] = _comp_band(df["monthly_income"]).astype(str)
 
     rows = []
@@ -372,6 +412,7 @@ def run():
     engine = get_engine()
 
     full_df = build_feature_frame(engine)
+    check_no_leakage(full_df)
 
     FIT_CENSOR_MONTHS = 24
     EVAL_CENSOR_MONTHS = 36
@@ -399,6 +440,13 @@ def run():
     # --- 2. Concordance index ---
     cox_cindex = concordance(eval_view["event_observed"].values, eval_view["duration_months"].values, cox_risk_eval)
     gbm_cindex = concordance(eval_view["event_observed"].values, eval_view["duration_months"].values, gbm_risk_eval)
+
+    cox_within_band = within_tenure_band_concordance(
+        eval_view["event_observed"].values, eval_view["duration_months"].values, cox_risk_eval, eval_view["tenure_years"].values
+    )
+    gbm_within_band = within_tenure_band_concordance(
+        eval_view["event_observed"].values, eval_view["duration_months"].values, gbm_risk_eval, eval_view["tenure_years"].values
+    )
 
     # --- 3/4. time-dependent AUC + integrated brier score (GBM) ---
     # Both cumulative_dynamic_auc and integrated_brier_score require every EVAL
@@ -438,6 +486,8 @@ def run():
         {"model": "cox_ph", "metric_name": "concordance_index", "horizon_months": None, "metric_value": cox_cindex, "ci_low": None, "ci_high": None},
         {"model": "gbm_survival", "metric_name": "concordance_index", "horizon_months": None, "metric_value": gbm_cindex, "ci_low": None, "ci_high": None},
         {"model": "gbm_survival", "metric_name": "integrated_brier_score", "horizon_months": None, "metric_value": ibs, "ci_low": None, "ci_high": None},
+        {"model": "cox_ph", "metric_name": "within_tenure_band_concordance", "horizon_months": None, "metric_value": cox_within_band["pooled"], "ci_low": None, "ci_high": None},
+        {"model": "gbm_survival", "metric_name": "within_tenure_band_concordance", "horizon_months": None, "metric_value": gbm_within_band["pooled"], "ci_low": None, "ci_high": None},
     ]
     for horizon_label, value in auc_results.items():
         if horizon_label == "mean_auc":
@@ -447,6 +497,12 @@ def run():
             metrics_rows.append({"model": "gbm_survival", "metric_name": "time_dependent_auc", "horizon_months": days, "metric_value": value, "ci_low": None, "ci_high": None})
     metrics_df = pd.DataFrame(metrics_rows)
     metrics_df.to_csv(os.path.join(OUT_DIR, "model_metrics.csv"), index=False)
+
+    within_band_rows = [dict(r, model="cox_ph") for r in cox_within_band["by_band"]] + [
+        dict(r, model="gbm_survival") for r in gbm_within_band["by_band"]
+    ]
+    within_band_df = pd.DataFrame(within_band_rows)
+    within_band_df.to_csv(os.path.join(OUT_DIR, "within_tenure_band_concordance.csv"), index=False)
 
     # --- 5. Segment calibration ---
     calibration_df = segment_calibration(eval_view, predicted_survival_12m)
@@ -507,7 +563,7 @@ def run():
         {
             "employee_id": full_df["employee_id"].values,
             "department": full_df["department"].values,
-            "tenure_band": (full_df["tenure_months"] / 12).apply(_tenure_band).values,
+            "tenure_band": full_df["tenure_years"].apply(_tenure_band).values,
             "data_split": full_df["data_split"].values,
             "cox_risk_score": all_cox_risk,
             "gbm_risk_score": all_gbm_risk,
@@ -530,6 +586,10 @@ def run():
 
     print("Attrition evaluation complete.")
     print(f"Cox c-index: {cox_cindex:.3f} | GBM c-index: {gbm_cindex:.3f} | GBM IBS: {ibs:.3f}")
+    print(
+        f"Within-tenure-band c-index (controls for tenure_years dominance): "
+        f"Cox {cox_within_band['pooled']:.3f} | GBM {gbm_within_band['pooled']:.3f}"
+    )
     return {
         "cox_cindex": cox_cindex,
         "gbm_cindex": gbm_cindex,

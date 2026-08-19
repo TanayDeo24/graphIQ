@@ -7,11 +7,11 @@ import pandas as pd
 from sksurv.ensemble import GradientBoostingSurvivalAnalysis
 from sksurv.util import Surv
 
-from src.models.attrition.features import encode_features
+from src.models.attrition.features import NON_FEATURE_COLUMNS, encode_features
 
 
 def get_feature_columns(encoded_df: pd.DataFrame) -> list:
-    return [c for c in encoded_df.columns if c not in ("employee_id", "duration_months", "event_observed", "data_split")]
+    return [c for c in encoded_df.columns if c not in NON_FEATURE_COLUMNS]
 
 
 def fit_gbm_model(train_df: pd.DataFrame, random_state: int = 42) -> tuple:
