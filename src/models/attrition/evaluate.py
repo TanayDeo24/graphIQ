@@ -200,6 +200,10 @@ def _calibration_rows_for_dimension(df: pd.DataFrame, dimension_name: str, group
         except Exception:
             observed = float(kmf.survival_function_.iloc[-1, 0])
         predicted = float(segment["predicted_survival_12m"].mean())
+        n_at_risk = int(len(segment))
+        event_count = int(
+            (segment["event_observed"] & (segment["duration_months"] <= CALIBRATION_HORIZON_MONTHS)).sum()
+        )
         rows.append(
             {
                 "segment_dimension": dimension_name,
@@ -209,6 +213,8 @@ def _calibration_rows_for_dimension(df: pd.DataFrame, dimension_name: str, group
                 "observed_survival": observed,
                 "calibration_error": abs(predicted - observed),
                 "logrank_p_value": p_value,
+                "n_at_risk": n_at_risk,
+                "event_count": event_count,
             }
         )
     return rows

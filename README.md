@@ -255,6 +255,65 @@ of this request (a stratified or time-varying-coefficient Cox model would be
 the standard next step), flagged for the same reason everything else in this
 section is.
 
+#### Segment calibration: sample size behind the numbers
+
+`segment_calibration.csv` (and the `attrition_calibration` Postgres table /
+`GET /api/attrition/calibration`) now report `n_at_risk` and `event_count`
+alongside `predicted_survival`/`observed_survival`/`calibration_error` for
+every segment, so a `calibration_error` can be read alongside how many
+actual departures it's based on rather than taken at face value. **Any
+segment with `event_count` below 10 is flagged below as low-confidence: its
+`calibration_error` is still reported, but should not be read with the same
+confidence as a well-populated segment.**
+
+| segment_dimension | segment_value | n_at_risk | event_count | observed_survival | calibration_error | confidence |
+|---|---|---|---|---|---|---|
+| department | Human Resources | 63 | 4 | 0.936 | 0.010 | ⚠ low (n_events=4) |
+| department | Research & Development | 961 | 47 | 0.949 | 0.015 | ok |
+| department | Sales | 446 | 24 | 0.944 | 0.004 | ok |
+| tenure_band | 0-2 | 342 | 75 | 0.735 | 0.088 | ok |
+| tenure_band | 2-5 | 434 | **0** | 1.000 | 0.033 | ⚠ **undefined (0 events)** |
+| tenure_band | 5+ | 694 | **0** | 1.000 | 0.025 | ⚠ **undefined (0 events)** |
+| comp_band | high | 490 | 7 | 0.985 | 0.021 | ⚠ low (n_events=7) |
+| comp_band | low | 490 | 60 | 0.870 | 0.012 | ok |
+| comp_band | mid | 490 | 8 | 0.983 | 0.020 | ⚠ low (n_events=8) |
+| department_x_tenure_band | Human Resources / 0-2 | 13 | 4 | 0.684 | 0.167 | ⚠ low (n_events=4) |
+| department_x_tenure_band | Human Resources / 2-5 | 23 | **0** | 1.000 | 0.034 | ⚠ **undefined (0 events)** |
+| department_x_tenure_band | Human Resources / 5+ | 27 | **0** | 1.000 | 0.025 | ⚠ **undefined (0 events)** |
+| department_x_tenure_band | Research & Development / 0-2 | 226 | 47 | 0.744 | 0.071 | ok |
+| department_x_tenure_band | Research & Development / 2-5 | 294 | **0** | 1.000 | 0.033 | ⚠ **undefined (0 events)** |
+| department_x_tenure_band | Research & Development / 5+ | 441 | **0** | 1.000 | 0.025 | ⚠ **undefined (0 events)** |
+| department_x_tenure_band | Sales / 0-2 | 103 | 24 | 0.719 | 0.116 | ok |
+| department_x_tenure_band | Sales / 2-5 | 117 | **0** | 1.000 | 0.034 | ⚠ **undefined (0 events)** |
+| department_x_tenure_band | Sales / 5+ | 226 | **0** | 1.000 | 0.025 | ⚠ **undefined (0 events)** |
+
+**Of the 18 segments, only 6 are actually well-supported** (`department`
+R&D/Sales, `comp_band` low, `tenure_band` 0-2, and the `department_x_tenure_band`
+0-2 crosses for R&D and Sales — all with `event_count` >= 24). The rest are
+low-confidence, and it's worse than "low" for the 12 segments covering
+`tenure_band` 2-5 or 5+ (both directly and every `department_x_tenure_band`
+cross with them): **every one of them has exactly zero observed events**, so
+their `observed_survival = 1.0` is not "near-perfect retention" — it's the
+Kaplan-Meier estimator's definitionally-trivial output when zero departures
+were observed at all, carrying no real information.
+
+The reason isn't a sampling fluke — it's structural, and worth stating
+plainly: `duration_months` is `(tenure_years - 1) * 12 +
+month_within_final_year` (see the fine-graining fix above), so anyone with
+real `tenure_years > 2` has `duration_months >= 25` by construction —
+verified directly against the generated data, whose minimum
+`duration_months` is 26 for the `2-5` band and 62 for the `5+` band. Neither
+band can *ever* contain an event within a 12-month calibration horizon,
+regardless of sample size or how the model performs. The `tenure_band`/
+`department_x_tenure_band` rows for 2-5 and 5+ years are not usable
+calibration checks at this horizon and shouldn't be read as either good or
+bad news about the model — they're mechanically empty. A calibration
+horizon longer than 12 months (e.g. 36, matching `eval_view`'s own censoring
+point) would be needed to say anything real about calibration for
+longer-tenured segments; not implemented here since it wasn't asked for,
+but flagged as the fix that would actually resolve this, rather than more
+sample size at the same horizon.
+
 ### Spend (anomaly detection)
 
 **Update: CUSUM's `slow_drift` detection was investigated and genuinely

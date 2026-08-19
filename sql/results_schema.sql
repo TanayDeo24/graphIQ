@@ -51,7 +51,9 @@ CREATE TABLE IF NOT EXISTS attrition_calibration (
     predicted_survival        DOUBLE PRECISION NOT NULL,
     observed_survival          DOUBLE PRECISION NOT NULL,
     calibration_error          DOUBLE PRECISION NOT NULL,
-    logrank_p_value            DOUBLE PRECISION NOT NULL
+    logrank_p_value            DOUBLE PRECISION NOT NULL,
+    n_at_risk                 INTEGER NOT NULL,   -- employees in this segment (test set)
+    event_count                INTEGER NOT NULL    -- departures observed within horizon_months
 );
 
 CREATE TABLE IF NOT EXISTS attrition_lead_time (
