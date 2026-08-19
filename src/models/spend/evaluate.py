@@ -18,8 +18,9 @@ from sklearn.metrics import average_precision_score, precision_score, recall_sco
 from sqlalchemy import text
 
 from src.db.connection import get_engine
-from src.models.spend import autoencoder, cusum, ensemble, isolation_forest
+from src.models.spend import autoencoder, cohort_cusum, cusum, ensemble, isolation_forest
 from src.models.spend.features import CATEGORIES, build_feature_frame, load_transactions
+from src.models.spend.tune_cusum import H_SIGMA_TUNED
 
 OUT_DIR = "data/generated/spend_outputs"
 N_BOOTSTRAP = 1000
@@ -38,11 +39,21 @@ def fit_and_score(df_features: pd.DataFrame) -> pd.DataFrame:
     ae_model, ae_mean, ae_std = autoencoder.fit_autoencoder(df_features)
     ae_scores = autoencoder.score(ae_model, df_features, ae_mean, ae_std)
 
-    monthly_cusum = cusum.compute_cusum_flags(df_features)
+    # H_SIGMA_TUNED (not the module's general-purpose H_SIGMA=5 default) is used
+    # for the boolean `flagged` column here -- see tune_cusum.py for the tuning-
+    # dataset procedure that derived it. Does not affect cusum_statistic itself
+    # (and therefore not PR-AUC), only the drift-delay/detection-timing metrics
+    # and the cusum_flag display field, which depend on the flag.
+    monthly_cusum = cusum.compute_cusum_flags(df_features, h=H_SIGMA_TUNED)
     cusum_mapped = cusum.map_flags_to_transactions(df_features, monthly_cusum)
+
+    monthly_cohort_cusum = cohort_cusum.compute_cohort_cusum_flags(df_features)
+    cohort_cusum_mapped = cohort_cusum.map_flags_to_transactions(df_features, monthly_cohort_cusum)
 
     combined = ensemble.combine(isf_scores, ae_scores, cusum_mapped["cusum_statistic"].values)
     combined["cusum_flag"] = cusum_mapped["flagged"].values
+    combined["cohort_cusum_statistic"] = cohort_cusum_mapped["cusum_statistic"].values
+    combined["cohort_cusum_flag"] = cohort_cusum_mapped["flagged"].values
 
     out = pd.concat([df_features.reset_index(drop=True), combined.reset_index(drop=True)], axis=1)
     return out, (isf_model, ae_model, ae_mean, ae_std)
@@ -313,9 +324,15 @@ def run():
     metrics_ae["detector"] = "autoencoder"
     metrics_cusum = precision_recall_pr_auc_by_type(scored, "cusum_statistic", scored["cusum_statistic"].quantile(OPERATING_QUANTILE))
     metrics_cusum["detector"] = "cusum"
+    metrics_cohort_cusum = precision_recall_pr_auc_by_type(
+        scored, "cohort_cusum_statistic", scored["cohort_cusum_statistic"].quantile(OPERATING_QUANTILE)
+    )
+    metrics_cohort_cusum["detector"] = "cohort_cusum"
     metrics_ensemble = precision_recall_pr_auc_by_type(scored, "ensemble_score", threshold)
     metrics_ensemble["detector"] = "ensemble"
-    eval_metrics_df = pd.concat([metrics_isf, metrics_ae, metrics_cusum, metrics_ensemble], ignore_index=True)
+    eval_metrics_df = pd.concat(
+        [metrics_isf, metrics_ae, metrics_cusum, metrics_cohort_cusum, metrics_ensemble], ignore_index=True
+    )
     eval_metrics_df = eval_metrics_df[["detector", "anomaly_type", "metric_name", "metric_value"]]
     eval_metrics_df.to_csv(os.path.join(OUT_DIR, "eval_metrics_by_type.csv"), index=False)
 

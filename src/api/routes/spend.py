@@ -5,7 +5,8 @@ from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
 
 from src.db.connection import get_engine
-from src.models.spend.cusum import H_SIGMA, K_SIGMA
+from src.models.spend.cusum import K_SIGMA
+from src.models.spend.tune_cusum import H_SIGMA_TUNED
 
 router = APIRouter()
 
@@ -69,7 +70,7 @@ def drift(employee_id: Optional[int] = None, department_id: Optional[int] = None
     timing = timing_df.to_dict(orient="records")[0] if not timing_df.empty else None
 
     return {
-        "control_limits": {"k_sigma": K_SIGMA, "h_sigma": H_SIGMA},
+        "control_limits": {"k_sigma": K_SIGMA, "h_sigma": H_SIGMA_TUNED},
         "series": df.to_dict(orient="records"),
         "detection_timing": timing,
     }

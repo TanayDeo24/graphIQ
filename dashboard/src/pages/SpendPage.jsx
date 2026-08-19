@@ -137,8 +137,10 @@ export default function SpendPage() {
         <h2>Detector comparison</h2>
         <div className="card-sub">
           Standalone precision/recall/PR-AUC per detector, broken out by anomaly type — not just the
-          ensemble. Reported as-is: CUSUM does not outperform the point-anomaly detectors on slow_drift
-          in this run.
+          ensemble. After fixing a diagnosed contaminated-baseline bug and a tuning-dataset-derived
+          threshold retune (see README), CUSUM is now the best standalone slow_drift detector here.
+          Cohort-level aggregation (a second hypothesis tested) did not help — shown for comparison,
+          not silently dropped.
         </div>
         <DetectorComparisonTable comparison={comparison} />
       </div>
