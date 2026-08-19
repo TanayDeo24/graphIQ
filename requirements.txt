@@ -25,6 +25,6 @@ sqlalchemy>=2.0,<2.1
 psycopg2-binary>=2.9,<3
 
 # Data acquisition / utils
-kaggle>=1.6,<1.7
+kaggle>=2.2,<2.3
 python-dotenv>=1.0,<2
 tqdm>=4.66,<5
