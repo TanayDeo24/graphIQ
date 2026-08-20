@@ -18,6 +18,7 @@ SENSITIVITY_DISCLAIMER = (
 def risk_scores(
     department: Optional[str] = None,
     tenure_band: Optional[str] = None,
+    employee_id: Optional[int] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
 ):
@@ -29,6 +30,9 @@ def risk_scores(
     if tenure_band:
         where_clauses.append("tenure_band = :tenure_band")
         params["tenure_band"] = tenure_band
+    if employee_id is not None:
+        where_clauses.append("employee_id = :employee_id")
+        params["employee_id"] = employee_id
     where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
     count_query = text(f"SELECT COUNT(*) FROM attrition_risk_scores {where_sql}")

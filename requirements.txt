@@ -20,6 +20,10 @@ fastapi>=0.110,<0.116
 uvicorn[standard]>=0.29,<0.31
 pydantic>=2.6,<3
 
+# Explainability agent
+google-genai>=1.0,<3
+tenacity>=8.0,<10
+
 # DB
 sqlalchemy>=2.0,<2.1
 psycopg2-binary>=2.9,<3
