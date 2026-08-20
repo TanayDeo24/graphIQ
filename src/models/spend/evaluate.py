@@ -464,7 +464,12 @@ def run():
     check_no_cohort_leakage(featured)
     scored, (isf_model, ae_model, ae_mean, ae_std) = fit_and_score(featured)
 
-    monthly_cusum = cusum.compute_cusum_flags(featured)
+    # h=H_SIGMA_TUNED, not the module's default H_SIGMA=5 -- must match the h
+    # used inside fit_and_score() above (bug found in a later audit: this call
+    # previously omitted h=, silently falling back to the untuned default, so
+    # every downstream drift-delay/detection-timing number and the annotated
+    # trajectory case selection were computed against the wrong threshold).
+    monthly_cusum = cusum.compute_cusum_flags(featured, h=H_SIGMA_TUNED)
 
     threshold = scored["ensemble_score"].quantile(OPERATING_QUANTILE)
     prevalence_rates = compute_prevalence_rates(scored)

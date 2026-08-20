@@ -90,7 +90,8 @@ Key generation choices (each documented in-line in the source):
   `assign_temporal_split()`. (The attrition model-fitting code goes one step
   further and uses a standard rolling-origin design for the same underlying
   reason; see the "why" note below.)
-- **~420,000 synthetic expense transactions**, lognormal amounts per
+- **~404,000 synthetic expense transactions** (403,889 exactly, per
+  injection-rate variant), lognormal amounts per
   merchant category, department-skewed category mix and frequency, documented
   in `spend_generator.py`'s module docstring.
 - **Anomaly injection at a primary 5% rate** (with 1%/10% variants generated
@@ -333,20 +334,29 @@ confidence as a well-populated segment.**
 
 **Of the 18 segments, only 6 are actually well-supported** (`department`
 R&D/Sales, `comp_band` low, `tenure_band` 0-2, and the `department_x_tenure_band`
-0-2 crosses for R&D and Sales — all with `event_count` >= 24). The rest are
-low-confidence, and it's worse than "low" for the 12 segments covering
-`tenure_band` 2-5 or 5+ (both directly and every `department_x_tenure_band`
-cross with them): **every one of them has exactly zero observed events**, so
-their `observed_survival = 1.0` is not "near-perfect retention" — it's the
-Kaplan-Meier estimator's definitionally-trivial output when zero departures
-were observed at all, carrying no real information.
+0-2 crosses for R&D and Sales — all with `event_count` >= 24). The remaining
+12 are low-confidence, but not uniformly so: **8 of those 12** — `tenure_band`
+2-5 and 5+ directly, plus every `department_x_tenure_band` cross with them
+(6 crosses) — are worse than merely "low," with **exactly zero observed
+events**, so their `observed_survival = 1.0` is not "near-perfect
+retention" — it's the Kaplan-Meier estimator's definitionally-trivial
+output when zero departures were observed at all, carrying no real
+information. The other 4 low-confidence segments (`department` Human
+Resources, `comp_band` high and mid, `department_x_tenure_band` Human
+Resources / 0-2) do have a handful of real events (4, 7, 8, and 4
+respectively) — thin, but not mechanically empty the way the zero-event
+ones are.
 
 The reason isn't a sampling fluke — it's structural, and worth stating
 plainly: `duration_months` is `(tenure_years - 1) * 12 +
 month_within_final_year` (see the fine-graining fix above), so anyone with
-real `tenure_years > 2` has `duration_months >= 25` by construction —
-verified directly against the generated data, whose minimum
-`duration_months` is 26 for the `2-5` band and 62 for the `5+` band. Neither
+real `tenure_years >= 2` (the `2-5` band's own lower edge) has
+`duration_months >= 13` by construction, and anyone with `tenure_years >= 5`
+(the `5+` band's lower edge) has `duration_months >= 49` — verified
+directly against the generated data, whose actual minimum `duration_months`
+is **14** for the `2-5` band and **50** for the `5+` band (both consistent
+with the formula, since the real employees at each band's exact boundary
+year land a month or two above the theoretical floor). Neither
 band can *ever* contain an event within a 12-month calibration horizon,
 regardless of sample size or how the model performs. The `tenure_band`/
 `department_x_tenure_band` rows for 2-5 and 5+ years are not usable
@@ -371,13 +381,13 @@ supports.
 **Real finding, reported as found:** within the `5+` tenure band, mean GBM
 risk score is effectively **identical** regardless of review trend —
 -0.45532251212755**46** (declining), -0.45532251212755**465** (stable),
--0.45532251212755**454** (improving), agreeing to 13 significant figures.
+-0.45532251212755**454** (improving), agreeing to 15 significant figures.
 For long-tenured employees, this model's prediction is being driven almost
 entirely by the tenure-band split itself, not by recent review trajectory —
 consistent with (and a more granular illustration of) the tenure-dominance
 finding already documented above for `duration_months`. The `2-5` and `0-2`
 bands do show real separation by trend (e.g. `0-2`: 1.72 improving vs. 1.92
-stable/declining), so this isn't a global failure of the trend feature —
+stable / 1.89 declining), so this isn't a global failure of the trend feature —
 it's specific to the long-tenure population where `duration_months`
 structurally dominates.
 
@@ -410,9 +420,15 @@ Forest and the autoencoder consume — which improved the autoencoder's
 `slow_drift` PR-AUC past CUSUM's. The autoencoder is the current best
 standalone `slow_drift` detector (0.111), with CUSUM second (0.058) —
 superseding the "CUSUM is now the best standalone detector" claim this
-README carried after the first investigation.** Both investigations are
-kept below in full, since both are genuine, validated findings — just not
-the final word on ranking.
+README carried after the first investigation. A third, later audit then
+found a real code bug (not a documentation error): CUSUM's
+detection-rate/delay metrics — never its PR-AUC — had silently been
+computed at the untuned `h=5` instead of the actually-tuned `h=14` since
+the retune was first introduced, because of a duplicate call site that was
+never updated to match. Fixed, and every affected number below is
+corrected (see "Correction" callout in the results table).** All three
+findings are kept below in full, since all three are genuine — just not
+the final word.
 
 #### Step 1 diagnostics (before any code changed)
 
@@ -481,14 +497,14 @@ Isolation Forest's and the autoencoder's input features (not CUSUM's) —
 see the fully-current comparison table after that section for where every
 detector stands now.
 
-| Metric | Before | After |
+| Metric | Before | After (as reported at the time) |
 |---|---|---|
 | CUSUM standalone `slow_drift` PR-AUC | 0.021 (worst of 4 detectors) | **0.052 (best of 5 detectors)** |
 | CUSUM standalone overall PR-AUC | 0.084 | 0.196 |
-| `slow_drift` cases ever detected by CUSUM | 15 of 579 (2.6%) | **443 of 579 (76.5%)** |
-| Of those detected: caught while still active / after it ended | 73% / 27% | 88% / 12% |
-| CUSUM drift detection delay: mean | 7.3mo (95% CI 4.3–10.7, n=15) | 4.2mo (95% CI 3.7–4.7, n=443) |
-| CUSUM drift detection delay: median | 5.0mo (95% CI 4.0–9.0, n=15) | 2.0mo (95% CI 1.0–3.0, n=443) |
+| `slow_drift` cases ever detected by CUSUM | 15 of 579 (2.6%) | 443 of 579 (76.5%) ⚠ *see correction below* |
+| Of those detected: caught while still active / after it ended | 73% / 27% | 88% / 12% ⚠ *see correction below* |
+| CUSUM drift detection delay: mean | 7.3mo (95% CI 4.3–10.7, n=15) | 4.2mo (95% CI 3.7–4.7, n=443) ⚠ *see correction below* |
+| CUSUM drift detection delay: median | 5.0mo (95% CI 4.0–9.0, n=15) | 2.0mo (95% CI 1.0–3.0, n=443) ⚠ *see correction below* |
 | Ensemble precision / recall / PR-AUC (overall) | 33.7% / 33.6% / 0.317 | 45.5% / 45.4% / 0.472 |
 | Ensemble `slow_drift` PR-AUC | 0.032 | 0.071 |
 | Top 10% of alerts capture (dollar-weighted gains) | 79.2% | 86.8% |
@@ -505,20 +521,46 @@ CUSUM's `point_spike` and `coordinated_pattern` PR-AUC improved too as a
 side effect of the baseline-estimation fix — a cleaner variance estimate
 helps its general discrimination, not just `slow_drift` specifically.
 
-The delay improvement (mean 7.3→4.2 months, median 5.0→2.0) in the table
-above is a direct consequence of the two fixes, not a separately-tuned
-metric — mean/median delay and its bootstrapped CI are simply recomputed
-each run against whichever cases are currently detected, and with 443
-detected cases instead of 15, both the point estimates and the CIs are far
-more informative than before (a 15-case sample was barely enough to support
-a CI at all). The `k=0.5σ` slack was left unchanged throughout this
-investigation — only `h` was retuned, per the procedure above. (The live
-dashboard and current run show 465 of 575 total injected `slow_drift` cases
-detected — the exact case count shifts slightly run-to-run due to the
-`spend_generator.py` reproducibility gap noted above, not a fix effect; the
-81% detection rate is consistent with the 76.5% recorded here.) See the
-fully-current comparison table below (Part A audit) for how PR-AUC numbers
-moved further after the second, unrelated fix.
+**⚠ Correction, found during a later self-consistency audit: the four
+detection-derived "After" rows above (marked ⚠) were never actually
+computed at the retuned `h=14` — they were silently computed at the
+untuned default `h=5` instead, due to a real code bug, not a documentation
+error.** `evaluate.py`'s `run()` function calls
+`cusum.compute_cusum_flags()` twice: once inside `fit_and_score()` (correctly
+passing `h=H_SIGMA_TUNED`, used for `cusum_statistic` and therefore PR-AUC,
+which is h-independent since it depends only on ranking) and once directly
+inside `run()` for the drift-delay/detection-timing metrics — and that
+second call was missing the `h=H_SIGMA_TUNED` argument, silently falling
+back to `H_SIGMA=5`, ever since the `h=14` retune was first introduced.
+The two PR-AUC rows above are unaffected and correct as shown (PR-AUC never
+depends on `h`). Fixed by adding the missing argument
+(`src/models/spend/evaluate.py`); the full spend evaluation was re-run to
+regenerate every downstream artifact. **Corrected, current figures
+(robust baseline + the actually-tuned `h=14`, live in
+`spend_drift_timing_summary` / `spend_drift_delay_summary` / the
+dashboard's Spend page):**
+
+| Metric | Corrected current value |
+|---|---|
+| `slow_drift` cases ever detected by CUSUM | 276 of 575 (48.0%) |
+| Of those detected: caught while still active / after it ended | 71.0% / 29.0% |
+| CUSUM drift detection delay: mean | 7.36mo (95% CI 6.44–8.37, n=276) |
+| CUSUM drift detection delay: median | 4.5mo (95% CI 3.0–6.0, n=276) |
+
+Read plainly: the properly-tuned `h=14` threshold is stricter than the
+`h=5` value the detection-timing code was accidentally still using, so it
+catches fewer cases overall (276 vs. the previously-reported 443) but with
+a lower false-detection rate by design — that's the documented tradeoff of
+raising `h` (see "Fixes applied" above: F1 kept rising well past `h=5`
+specifically because a stricter threshold cuts spurious month-to-month
+noise). The core, still-valid finding from this investigation is untouched
+by this bug: CUSUM's robust-baseline fix and `h` retune genuinely improved
+its `slow_drift` **PR-AUC** (0.021→0.052 at the time, now 0.058 — see the
+fully-current table below), since PR-AUC was never affected. What changed
+is that the specific detection-*rate*/delay figures quoted above and
+throughout the rest of this README as "after the retune" were wrong and
+are superseded by the corrected table just above. The `k=0.5σ` slack was
+left unchanged throughout — only `h` was retuned, per the procedure above.
 
 #### Part A audit (this session): cohort-leakage guardrail + a second contamination bug
 
@@ -566,8 +608,9 @@ transactions, making MAD-scaled deviations blow up).
 | Autoencoder overall PR-AUC | 0.464 | 0.462 |
 
 Mixed, honestly: Isolation Forest improved across the board. The
-autoencoder's `slow_drift` and `coordinated_pattern` PR-AUC more than
-doubled — a cleaner, uncontaminated deviation signal is exactly what a
+autoencoder's `slow_drift` PR-AUC more than doubled (0.051→0.111, 2.2x)
+and `coordinated_pattern` improved more modestly (0.080→0.102, 1.3x — not
+a doubling) — a cleaner, uncontaminated deviation signal is exactly what a
 reconstruction-error-based detector benefits most from — but its
 `point_spike` PR-AUC dropped (0.863→0.669), since the old contaminated
 feature was, for point spikes specifically, incidentally amplifying the
@@ -607,6 +650,21 @@ or the autoencoder's `slow_drift` lift of 3.5–6.7x, which is weak in
 absolute PR-AUC terms but genuinely, meaningfully better than chance at
 this base rate.
 
+**Stated plainly, not glossed over: the ensemble's `point_spike` PR-AUC
+(0.767) is *lower* than Isolation Forest alone (0.974).** The ensemble is
+a naive rank-average across all 5 detectors, unweighted by how well each
+one actually performs on a given anomaly type — and Cohort CUSUM's
+near-random `point_spike` performance (0.018, ~1.1x lift) drags the
+average down even though 3 of the other 4 detectors (Isolation Forest,
+autoencoder, CUSUM) do reasonably-to-very well on that type. This is a
+real, legitimate finding about the limits of naive rank-averaging, not a
+bug — the ensemble still wins on `overall` and both other anomaly types
+precisely because it isn't dragged down everywhere, just here, by one
+consistently weak detector. A per-type-aware ensembling strategy (e.g.
+weighting each detector by its own per-type validation PR-AUC rather than
+averaging all five equally) would be the natural next step to fix this
+specific weakness — not implemented here, since it wasn't asked for.
+
 **The current, fully-honest ranking for `slow_drift` specifically: the
 autoencoder (0.111 / 6.7x) is the best standalone detector, CUSUM second
 (0.058 / 3.5x), Isolation Forest third (0.039 / 2.3x), cohort CUSUM last
@@ -617,8 +675,13 @@ this session's second, independent fix — reported here rather than
 silently corrected. For `point_spike` and `coordinated_pattern`, Isolation
 Forest and the autoencoder remain the strongest detectors, as expected for
 point-anomaly-oriented methods. Robustness across injection rates (1%/5%/10%,
-ensemble, unaffected by this session's fixes): `slow_drift` PR-AUC 0.016 /
-0.071 / 0.076, `point_spike` stable at 0.59–0.83.
+ensemble): `slow_drift` PR-AUC 0.013 / 0.113 / 0.154, `point_spike` 0.54 /
+0.77 / 0.83. (These numbers **are** affected by this session's Part A
+fix, same as the rest of the ensemble's figures — the robustness check
+reruns the full detector pipeline at each injection rate, so it picked up
+the corrected Isolation Forest/autoencoder features same as everything
+else. An earlier draft of this README claimed these were unaffected; that
+was wrong and is corrected here.)
 
 #### Annotated CUSUM trajectories
 
@@ -628,10 +691,12 @@ Five real, detected `slow_drift` cases (`select_annotated_cusum_cases()`,
 dashboard's annotated trajectory chart, chosen to show the range of real
 outcomes rather than cherry-picking clean wins: 4 caught while the drift
 was still active, 1 caught only after the drift window had already ended
-(flagged in month 2022-10 against an end month of 2022-07). Each case
-renders its full monthly CUSUM statistic trajectory against the `h=14`
+(flagged 2023-07 against an end month of 2022-12). Each case renders its
+full monthly CUSUM statistic trajectory against the actually-tuned `h=14`
 control limit, with the injected drift window shaded and the detection
-month marked.
+month marked. (These case selections and dates were regenerated after the
+`h=14` detection-timing bug fix documented above — an earlier version of
+this README cited different example dates, computed under the same bug.)
 
 (Selecting these cases surfaced a real bug, since fixed: the "caught during
 active window" filter used `~detected["caught_during_active_window"]` on an
@@ -648,15 +713,15 @@ shown above to be indistinguishable from random):
 
 | Combination | Transaction count | Share |
 |---|---|---|
-| CUSUM only | 15,812 | 35.4% |
-| IF + AE (both, not CUSUM) | 8,527 | 19.1% |
-| IF only | 8,422 | 18.8% |
-| AE only | 7,785 | 17.4% |
+| CUSUM only | 15,812 | 35.2% |
+| IF + AE (both, not CUSUM) | 8,527 | 19.0% |
+| IF only | 8,422 | 18.7% |
+| AE only | 7,785 | 17.3% |
 | All three | 2,744 | 6.1% |
 | AE + CUSUM | 1,139 | 2.5% |
 | IF + CUSUM | 502 | 1.1% |
 
-**71.6% of flagged transactions are flagged by only one detector** — the
+**71.3% of flagged transactions are flagged by only one detector** — the
 three methods are catching substantially different things, not converging
 on the same alerts, which is the practical case for running an ensemble of
 structurally different detectors (point-anomaly, reconstruction-error, and
