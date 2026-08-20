@@ -5,6 +5,9 @@ import GainsCurveChart from "../components/GainsCurveChart";
 import CusumChart from "../components/CusumChart";
 import DetectorComparisonTable from "../components/DetectorComparisonTable";
 import TransactionExplainPanel from "../components/TransactionExplainPanel";
+import DetectorOverlapChart from "../components/DetectorOverlapChart";
+import AnnotatedCusumTrajectory from "../components/AnnotatedCusumTrajectory";
+import DollarTreemap from "../components/DollarTreemap";
 
 const PAGE_SIZE = 15;
 
@@ -21,6 +24,9 @@ export default function SpendPage() {
   const [drift, setDrift] = useState(null);
   const [comparison, setComparison] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [overlap, setOverlap] = useState(null);
+  const [treemap, setTreemap] = useState(null);
+  const [annotatedTrajectories, setAnnotatedTrajectories] = useState(null);
 
   useEffect(() => {
     setLoading(true);
@@ -39,6 +45,9 @@ export default function SpendPage() {
     api.gainsCurve().then(setGainsCurve);
     api.alertFatigue().then((rows) => setAlertFatigue(rows[0]));
     api.detectorComparison().then(setComparison);
+    api.detectorOverlap().then(setOverlap);
+    api.dollarTreemap().then(setTreemap);
+    api.cusumAnnotatedTrajectories().then(setAnnotatedTrajectories);
   }, []);
 
   useEffect(() => {
@@ -137,10 +146,11 @@ export default function SpendPage() {
         <h2>Detector comparison</h2>
         <div className="card-sub">
           Standalone precision/recall/PR-AUC per detector, broken out by anomaly type — not just the
-          ensemble. After fixing a diagnosed contaminated-baseline bug and a tuning-dataset-derived
-          threshold retune (see README), CUSUM is now the best standalone slow_drift detector here.
-          Cohort-level aggregation (a second hypothesis tested) did not help — shown for comparison,
-          not silently dropped.
+          ensemble. Multiple rounds of diagnosed fixes (contaminated-baseline corrections in both CUSUM
+          and the Isolation Forest/autoencoder features, a tuning-dataset-derived CUSUM threshold retune)
+          substantially improved every feature-consuming detector's slow_drift performance — see the
+          README for the full history. Cohort-level aggregation (a tested hypothesis) did not help —
+          shown for comparison, not silently dropped.
         </div>
         <DetectorComparisonTable comparison={comparison} />
       </div>
@@ -176,6 +186,24 @@ export default function SpendPage() {
             </p>
           )}
         </div>
+      </div>
+
+      <div className="card">
+        <h2>Detector overlap</h2>
+        <div className="card-sub">At the operating threshold, how many transactions are flagged by exactly 1, 2, or 3 of {"{"}Isolation Forest, Autoencoder, CUSUM{"}"} (Cohort CUSUM excluded — dominated).</div>
+        <DetectorOverlapChart overlap={overlap} />
+      </div>
+
+      <div className="card">
+        <h2>Annotated CUSUM trajectories</h2>
+        <div className="card-sub">5 real detected slow_drift cases, full monthly trajectory, drift window shaded, control limit and detection month marked.</div>
+        <AnnotatedCusumTrajectory data={annotatedTrajectories?.cases} controlLimits={annotatedTrajectories?.control_limits} />
+      </div>
+
+      <div className="card">
+        <h2>Dollar treemap</h2>
+        <div className="card-sub">Department x category, sized by anomalous dollar volume, colored by anomaly type.</div>
+        <DollarTreemap data={treemap} />
       </div>
     </div>
   );

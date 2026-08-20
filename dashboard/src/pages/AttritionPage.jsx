@@ -4,6 +4,8 @@ import RiskScoreTable from "../components/RiskScoreTable";
 import CalibrationHeatmap from "../components/CalibrationHeatmap";
 import LeadTimeChart from "../components/LeadTimeChart";
 import ShapBarChart from "../components/ShapBarChart";
+import InteractionHeatmap from "../components/InteractionHeatmap";
+import RiskMigrationSankey from "../components/RiskMigrationSankey";
 
 const PAGE_SIZE = 15;
 
@@ -17,6 +19,8 @@ export default function AttritionPage() {
   const [selectedEmployee, setSelectedEmployee] = useState(null);
   const [shap, setShap] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [interactionHeatmap, setInteractionHeatmap] = useState(null);
+  const [riskMigration, setRiskMigration] = useState(null);
 
   useEffect(() => {
     setLoading(true);
@@ -34,6 +38,8 @@ export default function AttritionPage() {
   useEffect(() => {
     api.calibration().then(setCalibration);
     api.leadTime().then(setLeadTime);
+    api.interactionHeatmap().then(setInteractionHeatmap);
+    api.riskMigration().then(setRiskMigration);
   }, []);
 
   useEffect(() => {
@@ -111,6 +117,24 @@ export default function AttritionPage() {
           <div className="card-sub">Months between risk-threshold crossing and actual departure (true positives), 95% bootstrap CI.</div>
           {leadTime ? <LeadTimeChart leadTime={leadTime} /> : <div className="loading">Loading...</div>}
         </div>
+      </div>
+
+      <div className="card">
+        <h2>Interaction risk heatmap</h2>
+        <div className="card-sub">Baseline tenure band x review-score trend, cell = mean baseline GBM risk score.</div>
+        <InteractionHeatmap data={interactionHeatmap} />
+      </div>
+
+      <div className="card">
+        <h2>Risk-migration Sankey (illustrative)</h2>
+        <div className="card-sub" style={{ color: "var(--status-critical)" }}>
+          {riskMigration?.disclaimer || "Illustrative re-scoring for visualization only — not the validated model used for every other metric on this page."}
+        </div>
+        {riskMigration ? (
+          <RiskMigrationSankey sankeyLinks={riskMigration.sankey_links} />
+        ) : (
+          <div className="loading">Loading...</div>
+        )}
       </div>
     </div>
   );

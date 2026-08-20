@@ -34,17 +34,27 @@ export default function DetectorComparisonTable({ comparison }) {
             <tr key={row.detector}>
               <td>{row.detector}</td>
               {ANOMALY_TYPE_COLS.map((c) => {
-                const value = row[c];
+                const prAuc = row[`${c}_pr_auc`];
+                const lift = row[`${c}_lift`];
                 return (
                   <td
                     key={c}
                     style={{
-                      background: value != null ? prAucColor(value) : undefined,
-                      color: value != null ? textColor(value) : undefined,
+                      background: prAuc != null ? prAucColor(prAuc) : undefined,
+                      color: prAuc != null ? textColor(prAuc) : undefined,
                       fontWeight: 600,
                     }}
                   >
-                    {value != null ? value.toFixed(3) : "—"}
+                    {prAuc != null ? (
+                      <>
+                        {prAuc.toFixed(3)}
+                        {lift != null && (
+                          <span style={{ fontWeight: 400, opacity: 0.85, fontSize: 11 }}> ({lift.toFixed(1)}x)</span>
+                        )}
+                      </>
+                    ) : (
+                      "—"
+                    )}
                   </td>
                 );
               })}
@@ -53,9 +63,12 @@ export default function DetectorComparisonTable({ comparison }) {
         </tbody>
       </table>
       <p style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 10 }}>
-        Cell = PR-AUC (0-1, higher is better). CUSUM's own precision/recall/PR-AUC per anomaly type,
-        computed standalone rather than only as part of the ensemble — shown here honestly whether or
-        not it outperforms the point-anomaly detectors on slow_drift.
+        Cell = PR-AUC (0-1, higher is better), with lift-over-random in parentheses (PR-AUC divided by
+        that anomaly type's actual injected prevalence rate — a detector no better than random guessing
+        scores ~1.0x regardless of type, so lift stays comparable across types with very different base
+        rates). CUSUM's own precision/recall/PR-AUC per anomaly type, computed standalone rather than
+        only as part of the ensemble — shown here honestly whether or not it outperforms the
+        point-anomaly detectors on slow_drift.
       </p>
     </div>
   );
