@@ -204,7 +204,11 @@ npm run dev
 ```
 
 Copy `.env.example` to `.env` first and adjust if your Postgres credentials
-differ from the defaults.
+differ from the defaults. The explainability agent (`POST /api/agent/chat`,
+the dashboard's chat panel, and `src/agent/eval/`) additionally needs a
+`GEMINI_API_KEY` in `.env` — get one from
+[Google AI Studio](https://ai.google.dev/); everything else in this repo
+works without it, but the chat panel will return an error until it's set.
 
 **If you don't have Docker:** any local Postgres 16 works — create a database
 and user matching your `.env`, then run `psql -f sql/schema.sql` against it
@@ -817,6 +821,196 @@ project.** This describes an observed association between two independently
 that attrition risk causes, prevents, or is caused by anomalous spend
 behavior, nor a real finding about any actual person or company.
 
+## Explainability agent
+
+`src/agent/` is a Gemini-Flash-backed chat agent (dashboard chat panel,
+`POST /api/agent/chat`) that answers questions about this project's own
+result tables — "what's employee 42's risk score," "why was transaction X
+flagged," "how calibrated is the model for the Sales department." It's
+built around one rule this project already applies everywhere else:
+**a safety-critical guarantee gets an automated, code-level check, not just
+a prompt instruction.** Here, that guarantee is that the agent never states
+a number it can't trace back to an actual tool result.
+
+### Architecture
+
+```
+question ──> Gemini (native function calling)
+                 │  picks which tool(s) to call, with what arguments
+                 │  (never writes the answer itself)
+                 ▼
+        src/agent/tools.py
+   thin wrappers around EXISTING FastAPI endpoints
+   (real HTTP calls, same routes the dashboard uses) ──> raw JSON, logged verbatim
+                 │
+                 ▼
+     src/agent/orchestrator.py (pure Python, not a model call)
+   deterministically maps "which tool(s) were called" -> one of the
+   fixed templates below, and reads every fill value directly out of
+   the tool result -- never transcribed by the model
+                 │
+                 ▼
+        src/agent/templates.py (fixed, pre-written text)
+   .format()-rendered in code; the model may add ONE short, number-free
+   "wrapper" sentence, itself re-checked below
+                 │
+                 ▼
+     src/agent/groundedness.py: check_groundedness(text, tool_results)
+   extracts every number-like token from the final text and verifies
+   each one traces back to a tool result (verbatim, or a simple
+   arithmetic combination of two values that do) -- BLOCKS the response
+   if not, returning a refusal template instead
+                 │
+                 ▼
+           returned to the user + logged
+    (question, tool calls, raw JSON, template, final text, pass/fail)
+```
+
+**Why template selection is code, not a second model call:** the build
+spec asks the model to "select which template fits" the question. A
+literal second free-form model call to pick a template key and transcribe
+fill values would reopen exactly the failure mode the groundedness check
+exists to close — a transcription slip that doesn't match the tool result.
+Since every tool maps unambiguously to exactly one template (Gemini's tool
+*choice* already carries that intent signal), the orchestrator makes this
+mapping deterministic in code instead, and only lets the model contribute
+a strictly-validated, number-free wrapper sentence. This is a stricter
+reading of the spec's principle 2 than the minimum, in service of its
+principle 1.
+
+### Template library
+
+Thirteen top-level templates (plus 2 internal SHAP-section sub-templates
+`attrition_risk_explanation` fills into its `{shap_section}` placeholder —
+15 in total), all written out in full, none stubbed:
+`attrition_risk_explanation` (with a sub-template for SHAP drivers when
+available, and a distinct one for when they aren't), `segment_calibration_explanation`,
+`segment_calibration_low_confidence` and `segment_calibration_zero_events`
+(two genuinely different, more hedged templates for low-n and zero-event
+segments — not the same sentence with a warning appended),
+`detector_comparison_explanation`, `spend_transaction_explanation`,
+`cross_component_explanation` (partial correlation as the primary figure,
+bivariate kept for reference, with the correlational-not-causal disclaimer
+as a fixed, non-optional sentence), `lead_time_explanation`,
+`gains_curve_explanation`, and four refusal variants
+(`refusal_not_found`, `refusal_out_of_scope`, `refusal_insufficient_data`,
+`refusal_groundedness_failed`).
+
+### Low-confidence handling
+
+Every tool that touches a segment this project has already flagged as
+low-confidence bakes that flag into its own return value — e.g.
+`get_segment_calibration` returns `is_low_confidence` / `is_zero_events`
+using the exact same `event_count < 10` threshold constant
+(`INTERACTION_HEATMAP_MIN_N`, imported from
+`src.models.attrition.evaluate`, not a second hardcoded "10") this project
+already uses for the interaction heatmap. The orchestrator checks these
+flags in code and forces the appropriate hedged/refusal template — it does
+not rely on the model noticing.
+
+### Groundedness guardrail
+
+`check_groundedness(response_text, tool_call_results)` regex-extracts every
+number-like token (currency, percentages, multipliers like "6.7x", plain
+decimals) from the final response text, and checks each one against every
+numeric value found anywhere in the raw tool results for that turn —
+directly, or as a simple pairwise arithmetic combination (difference,
+sum, ratio, percentage-change) of two such values, matched with rounding
+tolerance and percent/fraction-scale awareness (a raw `0.48` legitimately
+renders as "48%"). If any number fails, the response is never returned —
+the orchestrator substitutes `refusal_groundedness_failed` instead and logs
+the failure. This exact function is imported unmodified by both the
+runtime path (`orchestrator.py`) and the eval suite (`src/agent/eval/`) —
+never reimplemented, per the build spec.
+
+Every turn is logged to `data/generated/agent_logs/conversations.jsonl`:
+question, page context, every tool call with its raw JSON result, the
+template used, the final response, and the groundedness check result —
+so any response can be independently re-verified after the fact.
+
+### Eval suite (`src/agent/eval/`)
+
+Four categories, run via `python -m src.agent.eval.run_eval`, results
+written to `data/generated/agent_eval/`:
+
+1. **Groundedness** — `check_groundedness()` (the same function, reused
+   unmodified) applied to 28 hand-written questions spanning every tool.
+2. **Tool-selection accuracy** — 27 labeled (question → expected tool)
+   pairs, 3 per tool, scored against Gemini's actual function-call choice
+   in isolation (not the full pipeline), with a confusion breakdown.
+3. **Refusal correctness** — 15 cases specifically targeting this
+   project's own already-documented low-confidence segments (the
+   `tenure_band` 2-5/5+ zero-event segments, the `Human Resources` /
+   `comp_band high` / `comp_band mid` low-n segments), plus not-found and
+   out-of-scope questions — scored on whether the agent used a
+   refusal/hedge template rather than answering with false confidence.
+4. **Latency** — p50/p95 end-to-end response time (Gemini round trip +
+   tool calls) across every full-pipeline call made in categories 1 and 3.
+
+**Results** (live run against `gemini-3.5-flash-lite`, machine-readable
+version in `data/generated/agent_eval/summary.json`):
+
+| Metric | Result |
+|---|---|
+| Groundedness pass rate | **100.0%** (28/28) |
+| Tool-selection accuracy | **100.0%** (27/27) |
+| Refusal correctness | **100.0%** (15/15) |
+| Latency: p50 / p95 / mean | 4.0s / 23.2s / 5.9s (n=43, min 0.7s, max 38.4s) |
+
+**Groundedness (100%) is true by construction, not a claim about model
+trustworthiness** — the orchestrator already blocks any response that
+fails `check_groundedness()` before it can be returned (substituting
+`refusal_groundedness_failed` instead), so this number validates that the
+*guardrail* is working end-to-end, not that nothing ever tries to state an
+ungrounded number. The eval suite includes a standing negative control
+proving this (`run_groundedness_negative_control()`,
+`data/generated/agent_eval/groundedness_negative_control.json`): a real
+`get_attrition_risk_score` tool result plus one number spliced in that was
+never returned by any tool ("92.7% chance they will leave within 6
+months") is checked against `check_groundedness()` directly — it correctly
+comes back ungrounded, flagging exactly `"92.7%"` and nothing else. This
+runs on every eval invocation, not just once during development, so the
+guardrail's negative case stays covered going forward, not just asserted
+here.
+
+**Tool-selection accuracy (100%, 27/27)** — every case landed in a clean
+diagonal confusion matrix (see `tool_selection_results.json`), including
+correctly calling *both* `get_attrition_risk_score` and
+`get_attrition_shap` for the two "why is X at risk" cases that need both.
+
+**Refusal correctness: 100% (15/15) now, but this is worth reporting
+honestly including how it got there.** The first live run measured
+**66.7% (10/15)** and printed 5 "failures." Investigating before reporting
+that number (rather than either accepting or silently fixing it) found
+that every one of the 5 was the agent working correctly — each had used
+`segment_calibration_zero_events` or `segment_calibration_low_confidence`,
+the two dedicated hedge templates this project's own principle 3
+*requires* to be distinct from a generic `refusal_*` response. The eval
+harness's scoring only recognized the `refusal_*` template-name prefix as
+"correctly refused," so it penalized the agent for using the more
+specific, more appropriate template instead of a generic one — a bug in
+`run_eval.py`'s scoring, not in `orchestrator.py`'s behavior. Fixed by
+scoring against an explicit `HEDGE_TEMPLATES` set that includes both
+`segment_calibration_*` variants alongside the four `refusal_*` templates,
+and re-ran. Kept in this README as the honest record of what was actually
+found, rather than only reporting the corrected number — this project's
+standing rule is to report what's found, not tune it away, and that
+applies to the eval's own bugs as much as the agent's.
+
+**Latency** — p50 4.0s / p95 23.2s reflects a real, deliberate tradeoff:
+`gemini-2.5-flash`'s free tier turned out to cap at **20 requests/day**
+for this project's key (discovered by hitting it mid-build, not assumed
+in advance) — far too low to run this eval suite at all, which is why the
+agent runs on `gemini-3.5-flash-lite` instead (see `gemini_client.py`).
+Even on the higher-quota model, transient `503`/`429` responses from
+Google's infra are routine enough to need real handling: every call is
+proactively throttled to stay under quota and retried with exponential
+backoff on transient errors. The p95 tail (up to 38.4s) is that retry
+backoff showing up in a handful of calls, not slow answers on the happy
+path — the p50 of 4.0s (one tool-call round trip + one optional wrapper-
+sentence round trip, each ~2s) is the representative number for a normal
+question.
+
 ## Repository layout
 
 ```
@@ -826,6 +1020,7 @@ src/eda/                mandatory EDA, both components
 src/models/attrition/    Cox PH + GBM survival models, all 8 eval metrics
 src/models/spend/         Isolation Forest + autoencoder + CUSUM + ensemble, all 6 eval metrics
 src/analysis/             cross-component join (validated) + risk-migration re-scoring (illustrative)
+src/agent/                explainability chat agent: tools, templates, groundedness guardrail, eval suite
 src/db/                 Postgres connection + loader
 src/api/                 FastAPI service layer
 dashboard/               React + Vite + recharts frontend (d3-sankey for the risk-migration Sankey only)
