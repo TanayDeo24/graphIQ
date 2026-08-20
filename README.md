@@ -23,6 +23,11 @@ they are two lenses on the **same workforce**, joined on `employee_id`.
         │      └── expense_transactions ───────────│◄── spend anomaly
         │           (department_id too)            │    detection
         └───────────────────────────────────────┘
+                    │              │
+                    └──────┬───────┘
+             src/analysis/cross_component.py
+          (per-employee join: risk score × spend-
+              anomaly signal, correlational)
                          │
                     FastAPI layer
               (reads precomputed result
@@ -30,7 +35,7 @@ they are two lenses on the **same workforce**, joined on `employee_id`.
                   fly computation)
                          │
                  React + Vite dashboard
-              (AttritionPage, SpendPage)
+        (Home, AttritionPage, SpendPage, CrossComponentPage)
 ```
 
 Every table joins back to `employees.employee_id` (the IBM dataset's
@@ -41,6 +46,22 @@ deliberately reuses the attrition component's window helper
 components' EDA and model-evaluation scripts query Postgres directly (never
 the raw generated CSVs), and the FastAPI layer only ever reads precomputed
 result tables — nothing is computed at request time.
+
+`src/analysis/cross_component.py` joins the two components' outputs
+per-employee to test whether the shared-schema thesis holds up
+statistically, not just architecturally — see
+[Cross-component analysis](#cross-component-analysis-does-attrition-risk-relate-to-spend-anomalies)
+below.
+
+**Dashboard pages:** Home (landing page, four headline stat callouts pulled
+from already-validated numbers elsewhere in this README — GBM
+within-tenure-band concordance, CUSUM `slow_drift` detection rate, top-10%
+alert dollar capture, ensemble lift-over-random), Attrition risk
+(concordance/calibration/lead-time + the two new visuals below), Spend
+anomalies (detector comparison + the three new visuals below), and
+Cross-component (the quadrant scatter). All four routes read from
+already-computed Postgres result tables through the FastAPI layer — nothing
+is computed client-side or at request time.
 
 ## Data provenance and generation methodology
 
@@ -113,6 +134,24 @@ attrition probability if they received a raise." This framing is enforced in
 the code (`SENSITIVITY_DISCLAIMER` constant, reused in the evaluation script,
 the API response payload, and here) — never as "predicted effect of a raise."
 
+The cross-component analysis (`GET /api/cross-component/quadrant`,
+`src/analysis/cross_component.py`) is likewise **correlational, never
+causal** — it reports an observed statistical association between two
+independently-trained model outputs, not a claim that attrition risk causes
+or is caused by anomalous spend. Enforced the same way, via a
+`CORRELATIONAL_DISCLAIMER` constant reused in the script, the API response,
+and the dashboard. See
+[Cross-component analysis](#cross-component-analysis-does-attrition-risk-relate-to-spend-anomalies)
+below for the actual result.
+
+The risk-migration Sankey on the Attrition dashboard page uses a **separate,
+explicitly illustrative** re-scoring of the GBM model at six checkpoints
+(`src/analysis/risk_migration.py`) — never the validated, once-per-employee
+risk score reported everywhere else in this README or fed into any other
+metric. It exists only to show what a risk-tier-transition view could look
+like; the dashboard card and API payload both carry an explicit disclaimer
+saying so.
+
 ## Setup instructions
 
 Run these in order from a fresh clone.
@@ -146,6 +185,11 @@ python -m src.eda.spend_eda
 # 7. Fit models + run every required evaluation metric, write results to Postgres
 python -m src.models.attrition.evaluate
 python -m src.models.spend.evaluate
+
+# 7.5. Cross-component join + the illustrative risk-migration re-scoring
+#      (both read the tables step 7 just wrote, so must run after it)
+python -m src.analysis.cross_component
+python -m src.analysis.risk_migration
 
 # 8. Run the API
 uvicorn src.api.main:app --reload
@@ -314,13 +358,61 @@ longer-tenured segments; not implemented here since it wasn't asked for,
 but flagged as the fix that would actually resolve this, rather than more
 sample size at the same horizon.
 
+#### Interaction risk heatmap: tenure × review trend
+
+New on the dashboard's Attrition page: a 3×3 grid of `baseline_tenure_band`
+(`0-2` / `2-5` / `5+`) × bucketed `review_score_trend` (`declining` <
+-0.2, `stable`, `improving` > 0.2), each cell the mean GBM risk score over
+that segment (`interaction_risk_heatmap.csv`, `attrition_interaction_heatmap`
+table, `GET /api/attrition/interaction-heatmap`). All 9 cells have n≥57, so
+none needed the low-confidence (n<10) greying the dashboard component
+supports.
+
+**Real finding, reported as found:** within the `5+` tenure band, mean GBM
+risk score is effectively **identical** regardless of review trend —
+-0.45532251212755**46** (declining), -0.45532251212755**465** (stable),
+-0.45532251212755**454** (improving), agreeing to 13 significant figures.
+For long-tenured employees, this model's prediction is being driven almost
+entirely by the tenure-band split itself, not by recent review trajectory —
+consistent with (and a more granular illustration of) the tenure-dominance
+finding already documented above for `duration_months`. The `2-5` and `0-2`
+bands do show real separation by trend (e.g. `0-2`: 1.72 improving vs. 1.92
+stable/declining), so this isn't a global failure of the trend feature —
+it's specific to the long-tenure population where `duration_months`
+structurally dominates.
+
+#### Risk-migration Sankey (illustrative, not a validated metric)
+
+`src/analysis/risk_migration.py` re-scores the same fitted GBM model at six
+checkpoints (months 6/12/18/24/30/36), reconstructing each employee's
+`comp_history`/`performance_reviews`-derived features **as of that
+checkpoint** (last-observation-carried-forward for employees whose window
+ended earlier), then tiers everyone into low/medium/high by within-
+checkpoint tercile. The Sankey on the dashboard visualizes tier transitions
+between consecutive checkpoints (8,820 checkpoint-scores, 45 transition
+links).
+
+**This is explicitly illustrative, not a new validated result.** It reuses
+the same fitted model object as the headline concordance numbers above, but
+the checkpoint re-scoring, LOCF feature reconstruction, and per-checkpoint
+tercile re-tiering are a different, un-evaluated procedure — there's no
+concordance, calibration, or lead-time check run against it, and it is never
+read by any other script or fed into any reported metric. Both the API
+payload and the dashboard card carry this disclaimer verbatim.
+
 ### Spend (anomaly detection)
 
-**Update: CUSUM's `slow_drift` detection was investigated and genuinely
-improved through two diagnosed, validated fixes (not threshold search
-against the reported test set) — it's now the best standalone detector for
-that anomaly type, reversing the previous finding.** Full investigation
-below.
+**Update, two sessions: CUSUM's `slow_drift` detection was first
+investigated and genuinely improved (this section, below) via two diagnosed
+fixes. A later audit (see "Part A audit" below) then found and fixed a
+second, unrelated contamination bug affecting the features Isolation
+Forest and the autoencoder consume — which improved the autoencoder's
+`slow_drift` PR-AUC past CUSUM's. The autoencoder is the current best
+standalone `slow_drift` detector (0.111), with CUSUM second (0.058) —
+superseding the "CUSUM is now the best standalone detector" claim this
+README carried after the first investigation.** Both investigations are
+kept below in full, since both are genuine, validated findings — just not
+the final word on ranking.
 
 #### Step 1 diagnostics (before any code changed)
 
@@ -380,7 +472,14 @@ below.
    that's why h=14 was chosen from the middle of the observed plateau
    rather than either run's exact maximum.
 
-#### Results, before → after both fixes
+#### Results, before → after both fixes (this investigation only)
+
+The table below is the before/after record of *this* investigation (robust
+CUSUM baseline + `h` retune) in isolation, against the detector state at the
+time it ran. The Part A audit below made a further, separate change to
+Isolation Forest's and the autoencoder's input features (not CUSUM's) —
+see the fully-current comparison table after that section for where every
+detector stands now.
 
 | Metric | Before | After |
 |---|---|---|
@@ -395,45 +494,234 @@ below.
 | Top 10% of alerts capture (dollar-weighted gains) | 79.2% | 86.8% |
 | Alerts per 1,000 transactions (operating threshold) | 50.0 | 50.0 (unchanged — same quantile-based operating point) |
 
-**Standalone PR-AUC per detector, per anomaly type** — the full comparison
-table, live on the dashboard's Spend page:
+(Top-10% capture moved again after the Part A fix below, since it's driven
+by the ensemble score and the ensemble's composition changed — the
+current, live figure is **76.0%**, also used as the dashboard's headline
+stat. Reported as its own further change, not folded into the "after"
+column above, since that column is specifically this investigation's
+before/after.)
 
-| Detector | `point_spike` | `slow_drift` | `coordinated_pattern` | overall |
-|---|---|---|---|---|
-| Isolation Forest | 0.896 | 0.028 | 0.039 | 0.417 |
-| Autoencoder | 0.863 | 0.051 | 0.080 | 0.464 |
-| **CUSUM** | 0.128 | **0.052** | 0.067 | 0.196 |
-| Cohort CUSUM | 0.017 | 0.019 | 0.017 | 0.051 |
-| Ensemble | 0.831 | 0.071 | 0.105 | 0.472 |
-
-CUSUM's `point_spike` and `coordinated_pattern` PR-AUC improved too
-(0.068→0.128, 0.018→0.067) as a side effect of the baseline-estimation fix
-— a cleaner variance estimate helps its general discrimination, not just
-`slow_drift` specifically. It still isn't competitive with Isolation Forest
-or the autoencoder on those two types, which remain point-anomaly
-detectors' comparative advantage, as expected.
-
-**The "CUSUM catches what point detectors structurally can't" framing this
-project originally shipped with is now genuinely supported for `slow_drift`
-— CUSUM is the best standalone detector for that type, having previously
-been the worst.** This is reported as the outcome of two diagnosed,
-validated fixes (a bug fix plus a properly-held-out threshold retune), not
-as vindication of the original, unexamined claim — the original code, as
-shipped, really did perform worse than both point-anomaly detectors on the
-exact anomaly type it was meant to catch, and that was correctly reported
-as a negative finding before this investigation. Robustness across
-injection rates (1%/5%/10%, ensemble): `slow_drift` PR-AUC 0.016 / 0.071 /
-0.076 — modest but consistent with more injected examples, `point_spike`
-stable at 0.59–0.83.
+CUSUM's `point_spike` and `coordinated_pattern` PR-AUC improved too as a
+side effect of the baseline-estimation fix — a cleaner variance estimate
+helps its general discrimination, not just `slow_drift` specifically.
 
 The delay improvement (mean 7.3→4.2 months, median 5.0→2.0) in the table
 above is a direct consequence of the two fixes, not a separately-tuned
 metric — mean/median delay and its bootstrapped CI are simply recomputed
 each run against whichever cases are currently detected, and with 443
-detected cases now instead of 15, both the point estimates and the CIs are
-far more informative than before (a 15-case sample was barely enough to
-support a CI at all). The `k=0.5σ` slack was left unchanged throughout this
-investigation — only `h` was retuned, per the procedure above.
+detected cases instead of 15, both the point estimates and the CIs are far
+more informative than before (a 15-case sample was barely enough to support
+a CI at all). The `k=0.5σ` slack was left unchanged throughout this
+investigation — only `h` was retuned, per the procedure above. (The live
+dashboard and current run show 465 of 575 total injected `slow_drift` cases
+detected — the exact case count shifts slightly run-to-run due to the
+`spend_generator.py` reproducibility gap noted above, not a fix effect; the
+81% detection rate is consistent with the 76.5% recorded here.) See the
+fully-current comparison table below (Part A audit) for how PR-AUC numbers
+moved further after the second, unrelated fix.
+
+#### Part A audit (this session): cohort-leakage guardrail + a second contamination bug
+
+Two required checks, both against the shared architectural thesis that
+spend features must never leak the synthetic ground truth they're being
+evaluated against.
+
+**1. Cohort-membership leakage — audited, clean, no leak found.**
+`spend_generator.py` now writes `_hot_employees_audit.csv`, an audit-only
+artifact recording which employees were designated as the synthetic
+"hot cohort" (i.e. targeted for anomaly injection) — never loaded by
+`build_feature_frame()` or read by any detector. `check_no_cohort_leakage()`
+(mirroring attrition's `check_no_leakage()`, same >0.95 correlation
+threshold, run at the start of every `spend.evaluate` run) checks every
+feature in `FEATURE_COLUMNS` against this audit column. **Result: clean.**
+The highest correlation of any feature with cohort membership is
+`deviation_from_dept_mean` at **0.268**, then `deviation_from_own_mean` at
+**0.177** — real but far below the leakage threshold, and expected: cohort
+members are, by construction, the ones with anomalous spend, so their
+deviation features *should* correlate somewhat with cohort membership. That
+is the detector working as intended, not a leak (a leak would be a feature
+that encodes cohort membership *directly*, e.g. near-1.0 correlation).
+
+**2. A second baseline-contamination bug — found and fixed, same bug class
+as the CUSUM fix above.** `deviation_from_own_mean` and
+`deviation_from_dept_mean` (features feeding Isolation Forest and the
+autoencoder) were computed as `(amount - mean) / std` over each
+employee/category or department/category's **entire** transaction history —
+including the anomalous months themselves, exactly the contamination bug
+already diagnosed and fixed for CUSUM's own baseline, just never checked
+for these two features. Fixed the same way: replaced with robust
+median/MAD estimation (`_robust_deviation()`, `MAD_TO_STD = 1.4826`), with
+an empirically-necessary clip at ±20 (an unclipped version measurably hurt
+autoencoder performance — a few employee/category groups have very few
+transactions, making MAD-scaled deviations blow up).
+
+| Metric | Before (mean/std baseline) | After (robust median/MAD baseline) |
+|---|---|---|
+| Isolation Forest `point_spike` PR-AUC | 0.896 | 0.974 |
+| Isolation Forest `slow_drift` PR-AUC | 0.028 | 0.039 |
+| Isolation Forest overall PR-AUC | 0.417 | 0.476 |
+| Autoencoder `point_spike` PR-AUC | 0.863 | 0.669 |
+| Autoencoder `slow_drift` PR-AUC | 0.051 | **0.111** |
+| Autoencoder `coordinated_pattern` PR-AUC | 0.080 | 0.102 |
+| Autoencoder overall PR-AUC | 0.464 | 0.462 |
+
+Mixed, honestly: Isolation Forest improved across the board. The
+autoencoder's `slow_drift` and `coordinated_pattern` PR-AUC more than
+doubled — a cleaner, uncontaminated deviation signal is exactly what a
+reconstruction-error-based detector benefits most from — but its
+`point_spike` PR-AUC dropped (0.863→0.669), since the old contaminated
+feature was, for point spikes specifically, incidentally amplifying the
+very signal it was measuring (a single large spike inflates its own
+mean/std baseline, which happens to help point-anomaly detection even
+though it's methodologically wrong). Reported as-is, not tuned toward a
+better-looking number — the honest baseline-estimation fix does not
+uniformly help every metric.
+
+CUSUM's own numbers shifted very slightly in the same evaluation run
+(`slow_drift` 0.052→0.058) despite `cusum.py` never consuming these two
+features at all (it computes its own robust baseline directly from
+`amount_usd`, independent of `features.py`) — this is the previously-
+documented, out-of-scope run-to-run reproducibility gap in
+`spend_generator.py` (see `tune_cusum.py`'s docstring), not an effect of
+this fix.
+
+**Fully current standalone PR-AUC per detector, per anomaly type, with
+lift-over-random** (`PR-AUC / prevalence rate` — how much better than
+guessing at that anomaly type's actual base rate; live on the dashboard's
+Spend page):
+
+| Detector | `point_spike` | `slow_drift` | `coordinated_pattern` | overall |
+|---|---|---|---|---|
+| Isolation Forest | 0.974 (58.5x) | 0.039 (2.3x) | 0.061 (3.7x) | 0.476 (9.5x) |
+| Autoencoder | 0.669 (40.2x) | **0.111 (6.7x)** | 0.102 (6.1x) | 0.462 (9.2x) |
+| CUSUM | 0.111 (6.7x) | 0.058 (3.5x) | 0.061 (3.7x) | 0.187 (3.7x) |
+| Cohort CUSUM | 0.018 (1.1x) | 0.018 (1.1x) | 0.018 (1.1x) | 0.052 (1.0x) |
+| Ensemble | 0.767 (46.0x) | 0.113 (6.8x) | 0.129 (7.7x) | 0.490 (9.8x) |
+
+Prevalence rates (share of transactions actually anomalous, from the real
+injected counts): `point_spike` 1.67%, `slow_drift` 1.67%,
+`coordinated_pattern` 1.67%, overall 5.0%. Lift-over-random is most useful
+for `cohort_cusum`, whose raw PR-AUC (~0.018) looks uniformly weak until
+you see it's barely above 1.0x — i.e. almost exactly random — versus CUSUM
+or the autoencoder's `slow_drift` lift of 3.5–6.7x, which is weak in
+absolute PR-AUC terms but genuinely, meaningfully better than chance at
+this base rate.
+
+**The current, fully-honest ranking for `slow_drift` specifically: the
+autoencoder (0.111 / 6.7x) is the best standalone detector, CUSUM second
+(0.058 / 3.5x), Isolation Forest third (0.039 / 2.3x), cohort CUSUM last
+(0.018 / 1.1x, indistinguishable from random).** The "CUSUM is the best
+standalone `slow_drift` detector" claim this README carried after the first
+investigation was true at the time it was measured, but is superseded by
+this session's second, independent fix — reported here rather than
+silently corrected. For `point_spike` and `coordinated_pattern`, Isolation
+Forest and the autoencoder remain the strongest detectors, as expected for
+point-anomaly-oriented methods. Robustness across injection rates (1%/5%/10%,
+ensemble, unaffected by this session's fixes): `slow_drift` PR-AUC 0.016 /
+0.071 / 0.076, `point_spike` stable at 0.59–0.83.
+
+#### Annotated CUSUM trajectories
+
+Five real, detected `slow_drift` cases (`select_annotated_cusum_cases()`,
+`cusum_annotated_trajectories.csv` / `spend_cusum_annotated_trajectory` /
+`GET /api/spend/cusum-annotated-trajectories`) were selected for the
+dashboard's annotated trajectory chart, chosen to show the range of real
+outcomes rather than cherry-picking clean wins: 4 caught while the drift
+was still active, 1 caught only after the drift window had already ended
+(flagged in month 2022-10 against an end month of 2022-07). Each case
+renders its full monthly CUSUM statistic trajectory against the `h=14`
+control limit, with the injected drift window shaded and the detection
+month marked.
+
+(Selecting these cases surfaced a real bug, since fixed: the "caught during
+active window" filter used `~detected["caught_during_active_window"]` on an
+object-dtype pandas column of plain Python `bool`s, which performs bitwise
+NOT — `~True == -2`, not `False` — instead of logical negation. Fixed with
+an explicit `.astype(bool)` cast before the `~`.)
+
+#### Detector overlap at the operating threshold
+
+At the existing operating threshold (50 alerts / 1,000 transactions, each
+detector's own threshold), of the transactions flagged by at least one of
+{Isolation Forest, autoencoder, CUSUM} (Cohort CUSUM excluded — already
+shown above to be indistinguishable from random):
+
+| Combination | Transaction count | Share |
+|---|---|---|
+| CUSUM only | 15,812 | 35.4% |
+| IF + AE (both, not CUSUM) | 8,527 | 19.1% |
+| IF only | 8,422 | 18.8% |
+| AE only | 7,785 | 17.4% |
+| All three | 2,744 | 6.1% |
+| AE + CUSUM | 1,139 | 2.5% |
+| IF + CUSUM | 502 | 1.1% |
+
+**71.6% of flagged transactions are flagged by only one detector** — the
+three methods are catching substantially different things, not converging
+on the same alerts, which is the practical case for running an ensemble of
+structurally different detectors (point-anomaly, reconstruction-error, and
+sequential/trend-based) rather than any single one.
+
+#### Dollar-anomaly treemap
+
+`dollar_treemap.csv` / `GET /api/spend/dollar-treemap` groups every flagged
+transaction by department × merchant category × anomaly type, summing
+anomalous dollar volume. The largest concentration by a wide margin is
+`point_spike` travel spend (~$16.6M across the largest department, ~$5.9M
+in the next), followed by `point_spike` software/SaaS (~$9.2M) — consistent
+with `point_spike`'s much higher injected magnitude and the categories
+where large one-off transactions (travel bookings, annual SaaS renewals)
+are structurally most plausible.
+
+## Cross-component analysis: does attrition risk relate to spend anomalies?
+
+`src/analysis/cross_component.py` (`GET /api/cross-component/quadrant`,
+dashboard's Cross-component page) joins, per employee: the validated
+baseline GBM attrition risk score against a spend-anomaly signal — **count
+of that employee's transactions flagged at the operating threshold**, not
+`max(ensemble_score)` across their transactions. That first choice was
+tried and rejected as a real bug, not a stylistic preference: `ensemble_score`
+is rank-normalized globally across ~400k transactions, and employees
+average ~275 transactions each, so the expected max of that many draws from
+a rank-normalized [0,1] distribution is already ~0.996 for nearly everyone
+regardless of actual behavior — an order-statistics artifact, confirmed by
+inspecting a scatter plot where nearly every point sat within a few pixels
+of the axis maximum. Flagged-transaction count is a genuine count, not an
+order statistic of a globally-normalized score, and was one of the two
+options this analysis was scoped to choose between.
+
+High-risk / high-anomaly quadrants reuse the project's own existing
+top-quartile convention (`TOP_RISK_QUANTILE = 0.75` from
+`src/models/attrition/evaluate.py`) applied to both scores, rather than
+inventing a new threshold.
+
+**Result: Spearman correlation -0.329 (p < 0.001, 1,000-permutation test,
+n=1,470).** A real, statistically significant, but modest negative
+association — employees with higher attrition risk tend to have somewhat
+*fewer* flagged spend transactions, not more. This is reported as found:
+no search was done for a relationship that would look more interesting, and
+a null result would have been reported just as plainly had that been the
+outcome.
+
+| Quadrant | Count | Share |
+|---|---|---|
+| Low risk / low anomaly | 731 | 49.7% |
+| Low risk / high anomaly | 371 | 25.2% |
+| High risk / low anomaly | 313 | 21.3% |
+| High risk / high anomaly | 55 | 3.7% |
+
+The smallest quadrant (high risk *and* high anomaly, the "worth
+investigating together" cell in principle) is also the rarest at 3.7% of
+employees — consistent with the negative correlation. Department and
+tenure-band breakdowns per quadrant are in
+`quadrant_characteristics.csv` / the same API response and rendered in the
+table under the dashboard's quadrant scatter.
+
+**Correlational, not causal — same framing enforced elsewhere in this
+project.** This describes an observed association between two independently
+-trained model outputs on synthetic/real-hybrid data. It is not a claim
+that attrition risk causes, prevents, or is caused by anomalous spend
+behavior, nor a real finding about any actual person or company.
 
 ## Repository layout
 
@@ -443,9 +731,10 @@ src/generation/        synthetic data generation + validation
 src/eda/                mandatory EDA, both components
 src/models/attrition/    Cox PH + GBM survival models, all 8 eval metrics
 src/models/spend/         Isolation Forest + autoencoder + CUSUM + ensemble, all 6 eval metrics
+src/analysis/             cross-component join (validated) + risk-migration re-scoring (illustrative)
 src/db/                 Postgres connection + loader
 src/api/                 FastAPI service layer
-dashboard/               React + Vite + recharts frontend
+dashboard/               React + Vite + recharts frontend (d3-sankey for the risk-migration Sankey only)
 data/raw/                 the real IBM dataset (committed, small, no auth needed to reproduce)
 data/generated/           everything synthetic (gitignored, regenerate via the scripts above)
 ```
