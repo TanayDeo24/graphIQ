@@ -36,9 +36,24 @@ export default function QuadrantScatter({ employees, summary }) {
     <div>
       {summary && (
         <p style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-          Spearman correlation: <strong>{summary.spearman_correlation.toFixed(3)}</strong>{" "}
-          (p {summary.p_value < 0.001 ? "< 0.001" : summary.p_value.toFixed(3)}, {summary.n_permutations}{" "}
-          permutations, n={summary.n_employees}). {summary.disclaimer}
+          {summary.partial_spearman_correlation != null ? (
+            <>
+              Partial Spearman correlation (controlling for {summary.partial_confounds}):{" "}
+              <strong>{summary.partial_spearman_correlation.toFixed(3)}</strong>{" "}
+              (p {summary.partial_p_value < 0.001 ? "< 0.001" : summary.partial_p_value.toFixed(3)},{" "}
+              {summary.n_permutations} permutations, n={summary.n_employees}) — survives confound control, reported
+              as the primary figure. Uncontrolled bivariate correlation:{" "}
+              <strong>{summary.spearman_correlation.toFixed(3)}</strong>{" "}
+              (p {summary.p_value < 0.001 ? "< 0.001" : summary.p_value.toFixed(3)}), kept for reference only.{" "}
+            </>
+          ) : (
+            <>
+              Spearman correlation: <strong>{summary.spearman_correlation.toFixed(3)}</strong>{" "}
+              (p {summary.p_value < 0.001 ? "< 0.001" : summary.p_value.toFixed(3)}, {summary.n_permutations}{" "}
+              permutations, n={summary.n_employees}).{" "}
+            </>
+          )}
+          {summary.disclaimer}
         </p>
       )}
       <ResponsiveContainer width="100%" height={460}>

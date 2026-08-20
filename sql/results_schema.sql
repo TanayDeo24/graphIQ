@@ -303,6 +303,13 @@ CREATE TABLE IF NOT EXISTS cross_component_summary (
     method_note              TEXT NOT NULL,
     disclaimer               TEXT NOT NULL
 );
+-- Partial-correlation columns (controlling for department + monthly_income) added
+-- after the table already existed in deployed databases -- ADD COLUMN IF NOT EXISTS
+-- rather than a new CREATE, so this migration is idempotent against a live table.
+ALTER TABLE cross_component_summary ADD COLUMN IF NOT EXISTS partial_spearman_correlation DOUBLE PRECISION;
+ALTER TABLE cross_component_summary ADD COLUMN IF NOT EXISTS partial_p_value DOUBLE PRECISION;
+ALTER TABLE cross_component_summary ADD COLUMN IF NOT EXISTS partial_confounds TEXT;
+ALTER TABLE cross_component_summary ADD COLUMN IF NOT EXISTS partial_method_note TEXT;
 
 CREATE TABLE IF NOT EXISTS cross_component_quadrant_characteristics (
     id                SERIAL PRIMARY KEY,

@@ -695,13 +695,42 @@ top-quartile convention (`TOP_RISK_QUANTILE = 0.75` from
 `src/models/attrition/evaluate.py`) applied to both scores, rather than
 inventing a new threshold.
 
-**Result: Spearman correlation -0.329 (p < 0.001, 1,000-permutation test,
-n=1,470).** A real, statistically significant, but modest negative
-association — employees with higher attrition risk tend to have somewhat
-*fewer* flagged spend transactions, not more. This is reported as found:
-no search was done for a relationship that would look more interesting, and
-a null result would have been reported just as plainly had that been the
-outcome.
+**Partial correlation check (does it survive controlling for confounds?).**
+`department` and income both plausibly drive both scores independently of
+any real relationship between them, so before treating the raw bivariate
+correlation as a headline number, it was checked against a **partial**
+Spearman correlation controlling for `department` and `monthly_income` —
+the continuous compensation field the attrition model actually keys off
+directly (`FEATURE_COLUMNS_NUMERIC` in
+`src/models/attrition/features.py`; `comp_band` is a derived bucket of the
+same field and isn't separately consumed by the model, so `monthly_income`
+is the more direct confound). No `pingouin` dependency added — implemented
+directly via OLS residualization: rank-transform both scores and
+`monthly_income`, one-hot encode `department`, regress each ranked score
+on `[department dummies, ranked income]`, and correlate the two residual
+series (Pearson correlation of residuals = partial Spearman correlation).
+Significance via the same style of permutation test as above, but applied
+to the residuals (Freedman-Lane-style: under the null of no partial
+association, it's the residuals that are exchangeable, not the raw,
+confound-carrying scores).
+
+**Result: the finding survives confound control, so the partial
+correlation is the primary reported number.** Bivariate Spearman
+correlation -0.329 (p < 0.001, 1,000 permutations, n=1,470); **partial
+Spearman correlation, controlling for department + monthly_income:
+-0.316 (p < 0.001, 1,000 permutations)** — a ~4% relative move, not the
+near-total collapse toward zero that would indicate the bivariate figure
+was mostly confound-driven. **-0.316 (partial) is reported as the primary
+figure going forward**, with -0.329 (bivariate, uncontrolled) kept for
+reference only. Both figures and both p-values are in
+`cross_component_summary` / `GET /api/cross-component/quadrant` and
+rendered together on the dashboard's Cross-component page. Read plainly:
+employees with higher attrition risk tend to have somewhat *fewer* flagged
+spend transactions, not more — a real, statistically significant, but
+modest negative association, not explained away by department or income.
+This is reported as found: no search was done for a relationship that
+would look more interesting, and a null (or confound-explained) result
+would have been reported just as plainly had that been the outcome.
 
 | Quadrant | Count | Share |
 |---|---|---|

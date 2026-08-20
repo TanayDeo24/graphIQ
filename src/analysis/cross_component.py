@@ -32,13 +32,27 @@ analysis elsewhere in this project. Any relationship found here describes
 an observed association between two model outputs on synthetic/real-hybrid
 data, never a claim that attrition risk causes (or is caused by) anomalous
 spend, or that either is a real signal about any actual person.
+
+PARTIAL CORRELATION CHECK: the bivariate Spearman correlation above is
+vulnerable to confounding -- department and income both plausibly drive
+*both* scores independently (e.g. some departments may have both higher
+attrition risk and different spend patterns for reasons unrelated to any
+real relationship between the two). `partial_spearman_with_permutation_test()`
+controls for department and monthly_income (the continuous compensation
+field the attrition model actually keys off -- see
+FEATURE_COLUMNS_NUMERIC in src/models/attrition/features.py; comp_band is
+a derived bucket of the same field and isn't separately consumed by the
+model, so monthly_income is the more direct confound to control for) via
+OLS-residualized partial Spearman correlation, no pingouin dependency
+needed. Reported alongside the bivariate figure in the summary table, API
+response, and README -- whichever way the partial result comes out.
 """
 
 import os
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
+from scipy.stats import pearsonr, rankdata, spearmanr
 from sqlalchemy import text
 
 from src.db.connection import get_engine
@@ -57,7 +71,9 @@ CORRELATIONAL_DISCLAIMER = (
 
 def load_attrition_risk(engine) -> pd.DataFrame:
     return pd.read_sql(
-        "SELECT employee_id, department, tenure_band, gbm_risk_score, is_top_risk_quartile FROM attrition_risk_scores",
+        "SELECT ars.employee_id, ars.department, ars.tenure_band, ars.gbm_risk_score, "
+        "ars.is_top_risk_quartile, e.monthly_income "
+        "FROM attrition_risk_scores ars JOIN employees e ON e.employee_id = ars.employee_id",
         engine,
     )
 
@@ -129,6 +145,63 @@ def spearman_with_permutation_test(x: np.ndarray, y: np.ndarray, n_permutations:
     }
 
 
+PARTIAL_CORR_METHOD_NOTE = (
+    "Partial Spearman correlation controlling for department and monthly_income "
+    "(no pingouin dependency -- implemented directly via OLS residualization, documented "
+    "here): rank-transform gbm_risk_score, spend_anomaly_score, and monthly_income; "
+    "one-hot encode department; regress each of ranked-risk and ranked-anomaly on "
+    "[department dummies, ranked income] and take residuals; the partial Spearman "
+    "correlation is the Pearson correlation of the two residual series. Significance via "
+    "a two-sided permutation test on the risk-score residual (Freedman-Lane-style: "
+    "residuals, not raw scores, are permuted, since under the null of 'no partial "
+    "association given the confounds' the residuals -- not the raw, confound-carrying "
+    "scores -- are exchangeable)."
+)
+
+
+def _confound_design_matrix(confounds: pd.DataFrame) -> np.ndarray:
+    department_dummies = pd.get_dummies(confounds["department"], drop_first=True).astype(float).values
+    income_rank = rankdata(confounds["monthly_income"].values)
+    return np.column_stack([department_dummies, income_rank])
+
+
+def partial_spearman_with_permutation_test(x: np.ndarray, y: np.ndarray, confounds: pd.DataFrame,
+                                            n_permutations: int = N_PERMUTATIONS, seed: int = RNG_SEED) -> dict:
+    """See PARTIAL_CORR_METHOD_NOTE for the full method. `confounds` must
+    have `department` and `monthly_income` columns, row-aligned with x/y."""
+    rank_x = rankdata(x)
+    rank_y = rankdata(y)
+    z = _confound_design_matrix(confounds)
+    design = np.column_stack([np.ones(len(x)), z])
+    # QR gives an orthonormal basis for the confound column space; projecting
+    # off it (v - Q @ Q.T @ v) is the OLS residual, and reusing the same Q for
+    # every permutation keeps each permuted residual an O(n*k) mat-vec instead
+    # of refitting a regression per permutation.
+    q, _ = np.linalg.qr(design)
+
+    def _residualize(v):
+        return v - q @ (q.T @ v)
+
+    resid_x = _residualize(rank_x)
+    resid_y = _residualize(rank_y)
+    observed_corr, _ = pearsonr(resid_x, resid_y)
+
+    rng = np.random.default_rng(seed)
+    permuted_corrs = np.empty(n_permutations)
+    for i in range(n_permutations):
+        shuffled_resid_x = rng.permutation(resid_x)
+        permuted_corrs[i], _ = pearsonr(shuffled_resid_x, resid_y)
+    p_value = float((np.abs(permuted_corrs) >= np.abs(observed_corr)).mean())
+
+    return {
+        "partial_spearman_correlation": float(observed_corr),
+        "p_value": p_value,
+        "n_permutations": n_permutations,
+        "confounds": "department, monthly_income",
+        "method_note": PARTIAL_CORR_METHOD_NOTE,
+    }
+
+
 def quadrant_characteristics(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for quadrant, group in df.groupby("quadrant"):
@@ -167,6 +240,11 @@ def run():
         f"significance via a two-sided permutation test ({N_PERMUTATIONS} permutations of the spend-anomaly "
         "score, p = fraction of permuted |correlation| >= observed |correlation|)."
     )
+
+    partial_stats = partial_spearman_with_permutation_test(
+        df["gbm_risk_score"].values, df["spend_anomaly_score"].values, df[["department", "monthly_income"]]
+    )
+
     summary_df = pd.DataFrame(
         [
             {
@@ -176,6 +254,10 @@ def run():
                 "n_employees": len(df),
                 "method_note": method_note,
                 "disclaimer": CORRELATIONAL_DISCLAIMER,
+                "partial_spearman_correlation": partial_stats["partial_spearman_correlation"],
+                "partial_p_value": partial_stats["p_value"],
+                "partial_confounds": partial_stats["confounds"],
+                "partial_method_note": partial_stats["method_note"],
             }
         ]
     )
@@ -197,10 +279,12 @@ def run():
     _write_table(engine, characteristics_df, "cross_component_quadrant_characteristics")
 
     print(f"n_employees={len(df)} (excluded {n_missing} with no transactions)")
-    print(f"Spearman correlation: {stats['spearman_correlation']:.4f} (p={stats['p_value']:.4f}, {N_PERMUTATIONS} permutations)")
+    print(f"Spearman correlation (bivariate): {stats['spearman_correlation']:.4f} (p={stats['p_value']:.4f}, {N_PERMUTATIONS} permutations)")
+    print(f"Spearman correlation (partial, controlling for department + monthly_income): "
+          f"{partial_stats['partial_spearman_correlation']:.4f} (p={partial_stats['p_value']:.4f}, {N_PERMUTATIONS} permutations)")
     print("Quadrant counts:", quadrant_counts)
     print(CORRELATIONAL_DISCLAIMER)
-    return {"stats": stats, "quadrant_counts": quadrant_counts, "n_employees": len(df)}
+    return {"stats": stats, "partial_stats": partial_stats, "quadrant_counts": quadrant_counts, "n_employees": len(df)}
 
 
 if __name__ == "__main__":
