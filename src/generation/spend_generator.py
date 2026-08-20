@@ -285,6 +285,15 @@ def generate_all(employees_path: str, out_dir: str) -> dict:
     hot_employees = set(rng.choice(employees["employee_id"].values, size=n_hot, replace=False).tolist())
     employee_ids = employees["employee_id"].tolist()
 
+    # Audit-only artifact: cohort membership must never be used as a model
+    # feature (see src/models/spend/features.py's check_no_cohort_leakage).
+    # Written here, not derived from any persisted transaction/employee
+    # column, specifically so it stays clearly separate from anything a
+    # detector could ever have access to.
+    pd.DataFrame(
+        {"employee_id": employee_ids, "is_designated_cohort_member": [e in hot_employees for e in employee_ids]}
+    ).to_csv(os.path.join(out_dir, "_hot_employees_audit.csv"), index=False)
+
     stats = {"base_transactions": len(base_df), "hot_employees": n_hot}
 
     for label, rate in INJECTION_RATES.items():
