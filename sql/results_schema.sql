@@ -102,6 +102,39 @@ CREATE TABLE IF NOT EXISTS attrition_shap_employee (
 );
 CREATE INDEX IF NOT EXISTS idx_attrition_shap_employee_id ON attrition_shap_employee(employee_id);
 
+-- Dashboard interaction heatmap: baseline_tenure_band x review_score_trend
+-- bucket, cell = mean baseline GBM risk score. low_confidence = n < 10.
+CREATE TABLE IF NOT EXISTS attrition_interaction_heatmap (
+    id                  SERIAL PRIMARY KEY,
+    tenure_band           TEXT NOT NULL,
+    review_trend_bucket    TEXT NOT NULL,
+    n                    INTEGER NOT NULL,
+    mean_gbm_risk_score     DOUBLE PRECISION,
+    low_confidence         BOOLEAN NOT NULL
+);
+
+-- ILLUSTRATIVE ONLY (src/analysis/risk_migration.py) -- a rolling re-scoring
+-- of the validated GBM model using comp_history/performance_reviews values
+-- as of each checkpoint, for the dashboard's risk-migration Sankey. Never
+-- used as, or mixed with, any validated evaluation metric.
+CREATE TABLE IF NOT EXISTS attrition_risk_migration_checkpoints (
+    id                SERIAL PRIMARY KEY,
+    employee_id        INTEGER NOT NULL REFERENCES employees(employee_id),
+    checkpoint_month     INTEGER NOT NULL,
+    risk_score          DOUBLE PRECISION NOT NULL,
+    tier               TEXT NOT NULL  -- 'low' | 'medium' | 'high', tercile at that checkpoint
+);
+CREATE INDEX IF NOT EXISTS idx_attrition_risk_migration_checkpoints_employee_id ON attrition_risk_migration_checkpoints(employee_id);
+
+CREATE TABLE IF NOT EXISTS attrition_risk_migration_sankey (
+    id                SERIAL PRIMARY KEY,
+    checkpoint_from      INTEGER NOT NULL,
+    checkpoint_to        INTEGER NOT NULL,
+    tier_from           TEXT NOT NULL,
+    tier_to             TEXT NOT NULL,
+    employee_count       INTEGER NOT NULL
+);
+
 -- =====================================================================
 -- Spend result tables
 -- =====================================================================
@@ -125,7 +158,7 @@ CREATE TABLE IF NOT EXISTS spend_eval_metrics (
     id            SERIAL PRIMARY KEY,
     detector       TEXT NOT NULL,   -- 'isolation_forest' | 'autoencoder' | 'cusum' | 'ensemble'
     anomaly_type    TEXT NOT NULL,   -- 'point_spike' | 'slow_drift' | 'coordinated_pattern' | 'overall'
-    metric_name     TEXT NOT NULL,   -- 'precision' | 'recall' | 'pr_auc'
+    metric_name     TEXT NOT NULL,   -- 'precision' | 'recall' | 'pr_auc' | 'lift_over_random'
     metric_value     DOUBLE PRECISION NOT NULL
 );
 
@@ -203,6 +236,40 @@ CREATE TABLE IF NOT EXISTS spend_robustness (
     pr_auc         DOUBLE PRECISION NOT NULL
 );
 
+-- Dashboard: detector overlap at the existing operating threshold.
+CREATE TABLE IF NOT EXISTS spend_detector_overlap (
+    id                SERIAL PRIMARY KEY,
+    combination         TEXT NOT NULL,    -- 'only_IF' | 'only_AE' | 'only_CUSUM' | 'IF+AE' | 'IF+CUSUM' | 'AE+CUSUM' | 'all_three'
+    transaction_count     INTEGER NOT NULL
+);
+
+-- Dashboard: department x category x anomaly_type dollar treemap.
+CREATE TABLE IF NOT EXISTS spend_dollar_treemap (
+    id                SERIAL PRIMARY KEY,
+    department_id       INTEGER NOT NULL REFERENCES departments(department_id),
+    merchant_category    TEXT NOT NULL,
+    anomaly_type        TEXT NOT NULL,
+    dollar_volume        DOUBLE PRECISION NOT NULL,
+    transaction_count     INTEGER NOT NULL
+);
+
+-- Dashboard: curated, annotated CUSUM trajectories for a handful of real
+-- detected slow_drift cases (see select_annotated_cusum_cases()).
+CREATE TABLE IF NOT EXISTS spend_cusum_annotated_trajectory (
+    id                          SERIAL PRIMARY KEY,
+    case_label                    TEXT NOT NULL,
+    employee_id                   INTEGER NOT NULL REFERENCES employees(employee_id),
+    merchant_category               TEXT NOT NULL,
+    month                        DATE NOT NULL,
+    cusum_statistic                 DOUBLE PRECISION NOT NULL,
+    flagged                       BOOLEAN NOT NULL,
+    onset_month                    DATE NOT NULL,
+    end_month                      DATE NOT NULL,
+    flagged_month                   DATE,
+    caught_during_active_window       BOOLEAN
+);
+CREATE INDEX IF NOT EXISTS idx_spend_cusum_annotated_trajectory_case_label ON spend_cusum_annotated_trajectory(case_label);
+
 CREATE TABLE IF NOT EXISTS spend_transaction_explain (
     id            SERIAL PRIMARY KEY,
     transaction_id BIGINT NOT NULL REFERENCES expense_transactions(transaction_id),
@@ -210,5 +277,40 @@ CREATE TABLE IF NOT EXISTS spend_transaction_explain (
     contribution    DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_spend_transaction_explain_transaction_id ON spend_transaction_explain(transaction_id);
+
+-- =====================================================================
+-- Cross-component result tables (src/analysis/cross_component.py)
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS cross_component_quadrant (
+    employee_id            INTEGER PRIMARY KEY REFERENCES employees(employee_id),
+    department              TEXT NOT NULL,
+    tenure_band              TEXT NOT NULL,
+    gbm_risk_score            DOUBLE PRECISION NOT NULL,
+    is_top_risk_quartile        BOOLEAN NOT NULL,
+    spend_anomaly_score         DOUBLE PRECISION NOT NULL,  -- max ensemble_score across the employee's transactions
+    is_top_spend_quartile        BOOLEAN NOT NULL,
+    quadrant                   TEXT NOT NULL  -- 'high_risk_high_anomaly' | 'high_risk_low_anomaly' | 'low_risk_high_anomaly' | 'low_risk_low_anomaly'
+);
+CREATE INDEX IF NOT EXISTS idx_cross_component_quadrant_quadrant ON cross_component_quadrant(quadrant);
+
+CREATE TABLE IF NOT EXISTS cross_component_summary (
+    id                     SERIAL PRIMARY KEY,
+    spearman_correlation      DOUBLE PRECISION NOT NULL,
+    p_value                  DOUBLE PRECISION NOT NULL,
+    n_permutations             INTEGER NOT NULL,
+    n_employees               INTEGER NOT NULL,
+    method_note              TEXT NOT NULL,
+    disclaimer               TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cross_component_quadrant_characteristics (
+    id                SERIAL PRIMARY KEY,
+    quadrant           TEXT NOT NULL,
+    dimension          TEXT NOT NULL,  -- 'department' | 'tenure_band'
+    dimension_value      TEXT NOT NULL,
+    count              INTEGER NOT NULL,
+    pct_of_quadrant      DOUBLE PRECISION NOT NULL
+);
 
 COMMIT;

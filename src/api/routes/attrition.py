@@ -84,3 +84,31 @@ def sensitivity():
         "disclaimer": SENSITIVITY_DISCLAIMER,
         "results": df.to_dict(orient="records"),
     }
+
+
+@router.get("/interaction-heatmap")
+def interaction_heatmap():
+    """baseline_tenure_band x review_score_trend-bucket grid, cell = mean
+    baseline GBM risk score. low_confidence cells (n < 10) should render
+    visually distinct (greyed), not colored as if reliable."""
+    engine = get_engine()
+    df = pd.read_sql("SELECT * FROM attrition_interaction_heatmap", engine)
+    return df.to_dict(orient="records")
+
+
+@router.get("/risk-migration")
+def risk_migration():
+    """ILLUSTRATIVE ONLY -- a rolling re-scoring of the validated GBM model
+    at 6 checkpoints, distinct from every other reported metric. See
+    src/analysis/risk_migration.py's module docstring."""
+    engine = get_engine()
+    checkpoints = pd.read_sql("SELECT * FROM attrition_risk_migration_checkpoints", engine)
+    sankey = pd.read_sql("SELECT * FROM attrition_risk_migration_sankey ORDER BY checkpoint_from, checkpoint_to", engine)
+    return {
+        "disclaimer": (
+            "Illustrative re-scoring for visualization only -- NOT the validated baseline-only model "
+            "used for every other reported metric in this project. Do not treat this as an evaluation result."
+        ),
+        "checkpoints": checkpoints.to_dict(orient="records"),
+        "sankey_links": sankey.to_dict(orient="records"),
+    }

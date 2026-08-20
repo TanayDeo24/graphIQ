@@ -119,6 +119,55 @@ def within_tenure_band_concordance(event_observed, duration_months, risk_score, 
 
 
 # ---------------------------------------------------------------------
+# Interaction risk heatmap (dashboard): baseline_tenure_band x
+# review_score_trend bucket, cell = mean baseline GBM risk score.
+# ---------------------------------------------------------------------
+REVIEW_TREND_DECLINING_MAX = -0.2
+REVIEW_TREND_IMPROVING_MIN = 0.2
+INTERACTION_HEATMAP_MIN_N = 10
+
+
+def _review_trend_bucket(value: float) -> str:
+    if value <= REVIEW_TREND_DECLINING_MAX:
+        return "declining"
+    if value >= REVIEW_TREND_IMPROVING_MIN:
+        return "improving"
+    return "stable"
+
+
+def interaction_risk_heatmap(full_df: pd.DataFrame, gbm_risk_score: np.ndarray) -> pd.DataFrame:
+    """3x3 grid for the dashboard: baseline_tenure_band x review_score_trend
+    bucket (declining: <= -0.2, stable: (-0.2, 0.2), improving: >= 0.2 --
+    thresholds chosen relative to review_score_trend's observed spread,
+    std ~0.54, so "stable" covers roughly the middle ~0.7 std and each tail
+    bucket is a real, not marginal, trend direction), cell = mean baseline
+    GBM risk score for employees in that cell. Cells with n < 10 are
+    flagged low_confidence (same INTERACTION_HEATMAP_MIN_N convention as
+    segment_calibration's low-confidence flag) rather than presented with
+    the same visual weight as a well-populated cell.
+    """
+    df = full_df.copy()
+    df["gbm_risk_score"] = gbm_risk_score
+    df["review_trend_bucket"] = df["review_score_trend"].apply(_review_trend_bucket)
+
+    rows = []
+    for tenure_band in ["0-2", "2-5", "5+"]:
+        for trend_bucket in ["declining", "stable", "improving"]:
+            cell = df[(df["baseline_tenure_band"] == tenure_band) & (df["review_trend_bucket"] == trend_bucket)]
+            n = len(cell)
+            rows.append(
+                {
+                    "tenure_band": tenure_band,
+                    "review_trend_bucket": trend_bucket,
+                    "n": n,
+                    "mean_gbm_risk_score": float(cell["gbm_risk_score"].mean()) if n > 0 else None,
+                    "low_confidence": n < INTERACTION_HEATMAP_MIN_N,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------
 # 3. Time-dependent AUC
 # ---------------------------------------------------------------------
 def time_dependent_auc(y_train, y_test, risk_score_test) -> dict:
@@ -579,8 +628,13 @@ def run():
     )
     risk_scores_df.to_csv(os.path.join(OUT_DIR, "risk_scores.csv"), index=False)
 
+    # --- interaction heatmap (dashboard) ---
+    interaction_heatmap_df = interaction_risk_heatmap(full_df, all_gbm_risk)
+    interaction_heatmap_df.to_csv(os.path.join(OUT_DIR, "interaction_risk_heatmap.csv"), index=False)
+
     # --- write to Postgres ---
     _write_table(engine, risk_scores_df, "attrition_risk_scores")
+    _write_table(engine, interaction_heatmap_df, "attrition_interaction_heatmap")
     _write_table(engine, metrics_df, "attrition_model_metrics")
     _write_table(engine, ph_summary, "attrition_ph_assumption")
     _write_table(engine, calibration_df, "attrition_calibration")

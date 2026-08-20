@@ -78,16 +78,26 @@ def drift(employee_id: Optional[int] = None, department_id: Optional[int] = None
 
 @router.get("/detector-comparison")
 def detector_comparison():
-    """PR-AUC for each detector (Isolation Forest / autoencoder / CUSUM /
-    ensemble), broken out per anomaly type — the standalone comparison
-    that shows which detector is actually good at what, honestly."""
+    """PR-AUC and lift-over-random (PR-AUC / that anomaly type's actual
+    injected prevalence rate) for each detector (Isolation Forest /
+    autoencoder / CUSUM / cohort CUSUM / ensemble), broken out per anomaly
+    type — the standalone comparison that shows which detector is
+    actually good at what, honestly, with base-rate differences across
+    types normalized out via lift."""
     engine = get_engine()
     df = pd.read_sql(
-        "SELECT detector, anomaly_type, metric_value FROM spend_eval_metrics WHERE metric_name = 'pr_auc'",
+        "SELECT detector, anomaly_type, metric_name, metric_value FROM spend_eval_metrics "
+        "WHERE metric_name IN ('pr_auc', 'lift_over_random')",
         engine,
     )
-    pivot = df.pivot_table(index="detector", columns="anomaly_type", values="metric_value").reset_index()
-    return pivot.to_dict(orient="records")
+    pr_auc_pivot = df[df["metric_name"] == "pr_auc"].pivot_table(index="detector", columns="anomaly_type", values="metric_value")
+    lift_pivot = df[df["metric_name"] == "lift_over_random"].pivot_table(index="detector", columns="anomaly_type", values="metric_value")
+
+    combined = pd.DataFrame(index=pr_auc_pivot.index)
+    for t in pr_auc_pivot.columns:
+        combined[f"{t}_pr_auc"] = pr_auc_pivot[t]
+        combined[f"{t}_lift"] = lift_pivot[t]
+    return combined.reset_index().to_dict(orient="records")
 
 
 @router.get("/alert-fatigue")
@@ -111,3 +121,42 @@ def explain_transaction(transaction_id: int):
             detail="No explanation available (only computed for transactions flagged at the operating threshold).",
         )
     return df.to_dict(orient="records")
+
+
+@router.get("/detector-overlap")
+def detector_overlap():
+    """At the existing operating threshold, how many transactions are
+    flagged by exactly 1, 2, or 3 of {Isolation Forest, Autoencoder,
+    CUSUM} (Cohort CUSUM excluded — dominated by the other three)."""
+    engine = get_engine()
+    df = pd.read_sql("SELECT combination, transaction_count FROM spend_detector_overlap", engine)
+    order = ["only_IF", "only_AE", "only_CUSUM", "IF+AE", "IF+CUSUM", "AE+CUSUM", "all_three"]
+    df["combination"] = pd.Categorical(df["combination"], categories=order, ordered=True)
+    return df.sort_values("combination").to_dict(orient="records")
+
+
+@router.get("/dollar-treemap")
+def dollar_treemap():
+    engine = get_engine()
+    df = pd.read_sql(
+        "SELECT t.department_id, d.department_name, t.merchant_category, t.anomaly_type, "
+        "t.dollar_volume, t.transaction_count FROM spend_dollar_treemap t "
+        "JOIN departments d ON d.department_id = t.department_id",
+        engine,
+    )
+    return df.to_dict(orient="records")
+
+
+@router.get("/cusum-annotated-trajectories")
+def cusum_annotated_trajectories():
+    """4-5 curated real detected slow_drift cases with their full monthly
+    CUSUM trajectory, for the annotated-trajectory chart."""
+    engine = get_engine()
+    df = pd.read_sql(
+        "SELECT * FROM spend_cusum_annotated_trajectory ORDER BY case_label, month",
+        engine,
+    )
+    return {
+        "control_limits": {"h_sigma": H_SIGMA_TUNED},
+        "cases": df.to_dict(orient="records"),
+    }

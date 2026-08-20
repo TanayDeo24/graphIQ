@@ -8,7 +8,7 @@ route computes a metric at request time.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api.routes import attrition, spend
+from src.api.routes import attrition, cross_component, headline, spend
 
 app = FastAPI(
     title="GraphIQ API",
@@ -29,6 +29,8 @@ app.add_middleware(
 
 app.include_router(attrition.router, prefix="/api/attrition", tags=["attrition"])
 app.include_router(spend.router, prefix="/api/spend", tags=["spend"])
+app.include_router(cross_component.router, prefix="/api/cross-component", tags=["cross-component"])
+app.include_router(headline.router, prefix="/api/headline", tags=["headline"])
 
 
 @app.get("/")
