@@ -28,4 +28,6 @@ export const api = {
   crossComponentQuadrant: () => client.get("/api/cross-component/quadrant").then((r) => r.data),
 
   headlineStats: () => client.get("/api/headline/stats").then((r) => r.data),
+
+  agentChat: (payload) => client.post("/api/agent/chat", payload).then((r) => r.data),
 };

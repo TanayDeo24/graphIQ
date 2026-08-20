@@ -4,6 +4,7 @@ import HomePage from "./pages/HomePage";
 import AttritionPage from "./pages/AttritionPage";
 import SpendPage from "./pages/SpendPage";
 import CrossComponentPage from "./pages/CrossComponentPage";
+import ChatPanel from "./components/ChatPanel";
 
 export default function App() {
   return (
@@ -40,6 +41,7 @@ export default function App() {
             <Route path="/cross-component" element={<CrossComponentPage />} />
           </Routes>
         </main>
+        <ChatPanel />
       </div>
     </HashRouter>
   );
