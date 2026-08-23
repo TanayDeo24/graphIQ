@@ -10,19 +10,23 @@ not decorative.
 
 import json
 import os
+import re
 import statistics
 import time
 
 from src.agent import doc_retrieval, llm_backend, orchestrator, sql_agent
 from src.agent.eval.datasets import (
     ADVERSARIAL_SQL_CASES,
+    COMBINED_TOOLCALL_TEST_CASES,
     COMBINED_TRIAGE_CASES,
     DOC_RETRIEVAL_CASES,
+    GATE_TEST_CASES,
     GENERALIZATION_REFUSAL_CASES,
     HEDGE_KEYWORDS,
     HELD_OUT_GENERALIZATION_SET,
     MITIGATION_CASES,
     RANKING_AGGREGATE_CASES,
+    RANKING_SQL_TEST_CASES,
     REFUSAL_CASES,
     ROUTING_CASES,
     SQL_GROUNDEDNESS_QUESTIONS,
@@ -30,7 +34,7 @@ from src.agent.eval.datasets import (
     TRUST_ACCURACY_CASES,
 )
 from src.agent.groundedness import check_groundedness
-from src.agent.orchestrator import _route_question
+from src.agent.orchestrator import _route_question, detect_hard_routed_intent
 from src.agent.sql_schema import ALLOWED_TABLES
 from src.agent.sql_validator import validate_and_prepare_sql
 
@@ -195,10 +199,30 @@ def run_routing_eval() -> dict:
             "question": case["question"], "expected_categories": sorted(case["expected_categories"]),
             "actual_categories": sorted(actual), "exact_match": exact_match, "correct": correct,
         })
-    accuracy = sum(r["correct"] for r in rows) / len(rows) if rows else 0.0
+    # Two DISTINCT metrics, deliberately relabeled (remediation build spec Section 6) after an
+    # earlier report presented them side by side in a way that read as contradictory (e.g. "12/13"
+    # next to "77% exact" -- 12/13 = 92.3%, not 77%, because these measure different things):
+    # superset_match_rate = did the routed set include everything expected, possibly plus extra
+    # (over-inclusion is treated as safe, per this function's own docstring); exact_match_rate =
+    # did the routed set match the expected set exactly, no more, no less. Also note (Section 6):
+    # since detect_hard_routed_intent() now intercepts mitigation, trust/accuracy, and
+    # generalization-refusal questions BEFORE this LLM router ever runs, this metric only measures
+    # routing quality for questions that still reach the router -- it is not a measure of overall
+    # agent correctness on those three intents anymore, which are covered by run_gate_eval() instead.
+    superset_match_rate = sum(r["correct"] for r in rows) / len(rows) if rows else 0.0
     exact_match_rate = sum(r["exact_match"] for r in rows) / len(rows) if rows else 0.0
-    summary = {"n_questions": len(rows), "accuracy": accuracy, "exact_match_rate": exact_match_rate,
-               "n_correct": sum(r["correct"] for r in rows), "n_incorrect": sum(not r["correct"] for r in rows)}
+    summary = {
+        "n_questions": len(rows),
+        "superset_match_rate": superset_match_rate,
+        "exact_match_rate": exact_match_rate,
+        "n_correct_superset": sum(r["correct"] for r in rows),
+        "n_incorrect_superset": sum(not r["correct"] for r in rows),
+        "scope_note": (
+            "Only measures questions that reach the LLM router -- mitigation, trust/accuracy, and "
+            "generalization-refusal questions are now intercepted by detect_hard_routed_intent() "
+            "before this router runs (see gate_results.json)."
+        ),
+    }
     _write_json("routing_results.json", {"summary": summary, "rows": rows})
     return {"summary": summary, "rows": rows}
 
@@ -409,6 +433,129 @@ def run_acceptance_check() -> dict:
 
 
 # ---------------------------------------------------------------------
+# 9. Deterministic pre-router gate test set (remediation build spec,
+# Section 3). Pure code-level test -- no LLM call needed, since
+# detect_hard_routed_intent() is a synchronous regex-based function --
+# so this is fast and can run every time regardless of backend.
+# ---------------------------------------------------------------------
+def run_gate_eval() -> dict:
+    rows = []
+    for case in GATE_TEST_CASES:
+        intent, _extra = detect_hard_routed_intent(case["question"])
+        correct = intent == case["expected_intent"]
+        rows.append({
+            "question": case["question"], "expected_intent": case["expected_intent"],
+            "actual_intent": intent, "correct": correct,
+        })
+    rate = sum(r["correct"] for r in rows) / len(rows) if rows else 0.0
+    summary = {"n_cases": len(rows), "pass_rate": rate, "n_passed": sum(r["correct"] for r in rows),
+               "n_failed": sum(not r["correct"] for r in rows)}
+    _write_json("gate_results.json", {"summary": summary, "rows": rows})
+    return {"summary": summary, "rows": rows}
+
+
+# ---------------------------------------------------------------------
+# 10. Ranking/aggregate SQL-generation test set (remediation build spec,
+# Section 4). The actual generated SQL is always reported, not just
+# pass/fail, per the spec's explicit instruction.
+# ---------------------------------------------------------------------
+def run_ranking_sql_eval() -> dict:
+    rows = []
+    for case in RANKING_SQL_TEST_CASES:
+        result = sql_agent.generate_and_execute_sql(case["question"])
+        sql_upper = (result.get("sql") or "").upper()
+        clauses_present = {clause: (clause in sql_upper) for clause in case["required_clauses"]}
+        correct = all(clauses_present.values()) and result["success"]
+        rows.append({
+            "question": case["question"], "required_clauses": case["required_clauses"],
+            "generated_sql": result.get("sql"), "sql_success": result["success"],
+            "clauses_present": clauses_present, "correct": correct,
+        })
+    rate = sum(r["correct"] for r in rows) / len(rows) if rows else 0.0
+    summary = {"n_cases": len(rows), "pass_rate": rate, "n_passed": sum(r["correct"] for r in rows)}
+    _write_json("ranking_sql_results.json", {"summary": summary, "rows": rows})
+    return {"summary": summary, "rows": rows}
+
+
+# ---------------------------------------------------------------------
+# 11. Combined-triage multi-tool-call test (remediation build spec,
+# Section 5). Correct if the tables touched across tool_calls_made span
+# both the attrition and spend domains -- however many calls that took;
+# see run_combined_toolcall_eval()'s inline comment for why call count
+# itself isn't the pass/fail criterion.
+# ---------------------------------------------------------------------
+def run_combined_toolcall_eval() -> dict:
+    rows = []
+    for q in COMBINED_TOOLCALL_TEST_CASES:
+        result = orchestrator.handle_question(q, page_context=None, conversation_history=[])
+        tool_calls = result.get("tool_calls_made") or []
+        all_tables = set()
+        for call in tool_calls:
+            all_tables |= set(call.get("tables_used") or [])
+        touches_attrition = any(t.startswith("attrition") or t.startswith("cross_component") for t in all_tables)
+        touches_spend = any(t.startswith("spend") for t in all_tables)
+        # Correct = both domains were touched, however many calls it took. The multi-call fallback
+        # (_gather_sql()) is a MEANS to that end, not the goal itself -- if the first generated
+        # query already spans both domains on its own (found live: it sometimes does, via a JOIN),
+        # that's a genuinely good outcome and shouldn't be marked wrong just because a second call
+        # never fired. n_tool_calls is still reported for transparency into which path happened.
+        correct = touches_attrition and touches_spend
+        rows.append({
+            "question": q, "n_tool_calls": len(tool_calls), "tool_calls_made": tool_calls,
+            "touches_attrition": touches_attrition, "touches_spend": touches_spend, "correct": correct,
+        })
+    rate = sum(r["correct"] for r in rows) / len(rows) if rows else 0.0
+    summary = {"n_cases": len(rows), "pass_rate": rate, "n_passed": sum(r["correct"] for r in rows)}
+    _write_json("combined_toolcall_results.json", {"summary": summary, "rows": rows})
+    return {"summary": summary, "rows": rows}
+
+
+# ---------------------------------------------------------------------
+# 12. Stub-detection guardrail (remediation build spec, Section 9.5). A
+# standing automated check, run as part of every eval run, so a
+# placeholder/stub shipping into a live response (as happened this
+# session -- a literal "TODO: handle high risk score for employee 4"
+# reached a real answer) is caught automatically going forward instead
+# of found by chance during manual review. Scans actual CODE, not model
+# output -- the earlier TODO was model-generated text, not a code stub;
+# this guardrail is for the other, more traditional failure mode: an
+# actual placeholder left in the codebase itself.
+# ---------------------------------------------------------------------
+_STUB_PATTERN = re.compile(
+    r"\b(TODO|FIXME|XXX|NotImplementedError)\b|"
+    r"\bpass\s*#|"
+    r"\b(mock|stub|placeholder|hardcoded|hard-coded)\b",
+    re.IGNORECASE,
+)
+_STUB_SCAN_DIR = "src/agent"
+# The eval/ subdirectory (this file included) is meta-tooling ABOUT the
+# agent -- it legitimately discusses these exact words in its own
+# guardrail implementation, dataset comments, and test descriptions, so
+# scanning it would make this guardrail permanently self-triggering and
+# useless. It scans the agent's actual RUNTIME code -- what could ship a
+# stub into a real response -- not the tooling that tests it.
+_STUB_SCAN_EXCLUDE_DIRS = {"eval", "__pycache__"}
+
+
+def run_stub_detection_guardrail() -> dict:
+    matches = []
+    for root, dirs, files in os.walk(_STUB_SCAN_DIR):
+        dirs[:] = [d for d in dirs if d not in _STUB_SCAN_EXCLUDE_DIRS]
+        for fname in files:
+            if not fname.endswith(".py"):
+                continue
+            path = os.path.join(root, fname)
+            with open(path, encoding="utf-8") as f:
+                for lineno, line in enumerate(f, start=1):
+                    if _STUB_PATTERN.search(line):
+                        matches.append({"file": path, "line": lineno, "text": line.strip()})
+    summary = {"n_matches": len(matches), "clean": len(matches) == 0, "scanned_dir": _STUB_SCAN_DIR,
+               "excluded_subdirs": sorted(_STUB_SCAN_EXCLUDE_DIRS)}
+    _write_json("stub_detection_results.json", {"summary": summary, "matches": matches})
+    return {"summary": summary, "matches": matches}
+
+
+# ---------------------------------------------------------------------
 # Latency
 # ---------------------------------------------------------------------
 def compute_latency_summary(all_latencies: list) -> dict:
@@ -447,7 +594,7 @@ def run_all():
 
     print("Running mechanism-routing accuracy eval...")
     routing = run_routing_eval()
-    print(f"  accuracy: {routing['summary']['accuracy']:.1%} ({routing['summary']['n_correct']}/{routing['summary']['n_questions']})")
+    print(f"  superset-match: {routing['summary']['superset_match_rate']:.1%}, exact-match: {routing['summary']['exact_match_rate']:.1%} ({routing['summary']['n_correct_superset']}/{routing['summary']['n_questions']})")
 
     print("Running refusal/hedge correctness eval...")
     refusal = run_refusal_eval()
@@ -470,6 +617,22 @@ def run_all():
     acceptance = run_acceptance_check()
     print(f"  is_refusal={acceptance['is_refusal']}, grounded={acceptance['grounded']}")
 
+    print("Running deterministic gate test set...")
+    gates = run_gate_eval()
+    print(f"  pass rate: {gates['summary']['pass_rate']:.1%} ({gates['summary']['n_passed']}/{gates['summary']['n_cases']})")
+
+    print("Running ranking/aggregate SQL-generation test set...")
+    ranking_sql = run_ranking_sql_eval()
+    print(f"  pass rate: {ranking_sql['summary']['pass_rate']:.1%} ({ranking_sql['summary']['n_passed']}/{ranking_sql['summary']['n_cases']})")
+
+    print("Running combined-triage multi-tool-call test...")
+    combined_toolcall = run_combined_toolcall_eval()
+    print(f"  pass rate: {combined_toolcall['summary']['pass_rate']:.1%} ({combined_toolcall['summary']['n_passed']}/{combined_toolcall['summary']['n_cases']})")
+
+    print("Running stub-detection guardrail...")
+    stub_check = run_stub_detection_guardrail()
+    print(f"  clean: {stub_check['summary']['clean']} ({stub_check['summary']['n_matches']} matches in {stub_check['summary']['scanned_dir']})")
+
     print("Computing latency summary...")
     all_latencies = ground["latencies"] + refusal["latencies"]
     latency = compute_latency_summary(all_latencies)
@@ -487,6 +650,10 @@ def run_all():
         "time_horizon_case": {k: v for k, v in time_horizon.items() if k != "response"},
         "held_out_generalization": held_out["summary"],
         "acceptance_check": acceptance,
+        "gate_tests": gates["summary"],
+        "ranking_sql_tests": ranking_sql["summary"],
+        "combined_toolcall_tests": combined_toolcall["summary"],
+        "stub_detection": stub_check["summary"],
         "latency": latency,
     }
     _write_json("summary.json", overall_summary)

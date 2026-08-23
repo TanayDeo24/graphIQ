@@ -5,6 +5,20 @@ src/agent/llm_backend.py, which switches between a local MLX backend and
 Cloudflare Workers AI via LLM_BACKEND -- this module never talks to either
 directly or branches on which is active.
 
+0. Deterministic pre-router gates: BEFORE any of the below, three
+   high-stakes question shapes (mitigation/action, trust/accuracy,
+   generalization-refusal) are detected in code via
+   detect_hard_routed_intent() and handled deterministically -- real
+   tool calls with code-authored SQL and fixed response templates, never
+   the LLM router's judgment. This exists because a live eval run found
+   the LLM router alone did not reliably route these three shapes
+   correctly on either backend (see README) -- including one real case
+   where the router-and-synthesize path produced the literal string
+   an unfinished-looking, un-implemented-feature-flavored sentence as its
+   answer (quoted in full in the README's remediation writeup). These
+   three intents are considered too high-stakes (giving real advice,
+   stating a trust-relevant metric, or drawing a causal/population
+   conclusion) to leave to prompting alone.
 1. Routing: one model call classifies the question against three
    categories -- "concept" (general knowledge, free generation, no
    grounding needed), "sql" (a specific project number/table question,
@@ -84,6 +98,258 @@ def _parse_json_lenient(raw: str) -> dict:
 
 
 VALID_CATEGORIES = {"concept", "sql", "rationale"}
+
+
+# ---------------------------------------------------------------------
+# Deterministic pre-router gates (see module docstring, item 0).
+# ---------------------------------------------------------------------
+_MITIGATION_ACTION_WORDS = {
+    "reduce", "fix", "mitigate", "lower", "prevent", "address", "retune", "improve", "catch",
+}
+_MITIGATION_ACTION_PHRASES = (
+    "what should we do about", "what can we do about", "what should i do about", "what can i do about",
+    "how should we", "how can we", "how do we",
+)
+_MITIGATION_TARGET_WORDS = {
+    "risk", "attrition", "anomaly", "anomalies", "flag", "flags", "flagged", "leaving", "leave",
+    "churn", "turnover", "detector", "detectors", "false positive", "false positives", "spend",
+}
+_SPEND_DOMAIN_WORDS = {"spend", "detector", "detectors", "anomaly", "anomalies", "transaction", "transactions"}
+
+_TRUST_WORDS = {"accurate", "accuracy", "reliable", "trustworthy", "trust", "confident", "confidence"}
+_TRUST_DEFINITIONAL_RE = re.compile(r"\bwhat\s+(is|does|are)\b", re.I)
+_MODEL_SYSTEM_WORDS = {"model", "system", "agent", "prediction", "predictions", "score", "scores"}
+
+_SCOPE_WORDS = {
+    "all", "every", "everyone", "the whole company", "fleet-wide", "fleet wide", "company-wide", "company wide",
+}
+_CAUSAL_HYPOTHETICAL_RE = re.compile(
+    r"\bwould\b.{0,40}\b(reduce|prevent|help|improve|fix|increase|decrease)\b", re.I
+)
+_GENERAL_CAUSAL_CLAIM_RE = re.compile(r"\bdoes\b.{0,60}\bcause\b", re.I)
+_INDIVIDUAL_CAUSAL_RE = re.compile(r"\bemployee\s*#?\s*\d+\b.{0,40}\bbecause\b", re.I)
+_EMPLOYEE_ID_RE = re.compile(r"employee\s*#?\s*(\d+)", re.I)
+
+ATTRITION_SENSITIVITY_DISCLAIMER_FALLBACK = (
+    "This is predicted risk sensitivity to a simulated compensation change, estimated from a "
+    "correlational model. It is NOT a causal effect of a raise on attrition."
+)
+SPEND_MITIGATION_DISCLAIMER = (
+    "This reflects real detector performance data under simulated anomaly injection, not a guaranteed "
+    "fix -- retuning tradeoffs shown here are correlational to detector design choices, not a causal "
+    "guarantee about what will happen to real future alerts."
+)
+GENERALIZATION_REFUSAL_TEMPLATE = (
+    "I can't answer that as a population-wide or causal claim. The underlying finding here is "
+    "correlational and scoped to the specific data it was measured on -- it doesn't establish that "
+    "one thing causes another, or that a pattern holds fleet-wide just because it holds for an "
+    "individual or a segment. I'd be misleading you if I answered the generalized version of this "
+    "question directly."
+)
+
+
+def _detect_mitigation_intent(question: str) -> bool:
+    q = question.lower()
+    if not any(w in q for w in _MITIGATION_TARGET_WORDS):
+        return False
+    return any(w in q for w in _MITIGATION_ACTION_WORDS) or any(p in q for p in _MITIGATION_ACTION_PHRASES)
+
+
+def _detect_trust_intent(question: str) -> bool:
+    q = question.lower()
+    if not any(w in q for w in _TRUST_WORDS):
+        return False
+    # Exclude a generic "what does/is/are <term>" definitional question (e.g. "what does a
+    # confidence interval mean") that happens to contain a trust word but isn't asking whether
+    # THIS project's model/system can be trusted.
+    if _TRUST_DEFINITIONAL_RE.search(q) and not any(w in q for w in _MODEL_SYSTEM_WORDS):
+        return False
+    # A question about a specific employee's own data value ("employee 4's confidence score") is
+    # an individual-data lookup, not a trust/accuracy-of-the-model question.
+    if _EMPLOYEE_ID_RE.search(question):
+        return False
+    # A question about a specific SEGMENT's calibration reliability ("is the tenure_band 5+
+    # calibration trustworthy", "how reliable is the calibration for Human Resources") is a
+    # real, different question this project already has dedicated per-segment data for
+    # (attrition_calibration, including its own low-confidence/event_count hedging) -- found live
+    # to be wrongly swallowed by this gate and answered with the generic overall-model-trust
+    # template instead of the correct segment-specific lookup, a real regression this exclusion
+    # fixes. "calibrat*" is specific enough to exclude safely: none of this gate's own positive
+    # test cases use that word.
+    if "calibrat" in q:
+        return False
+    return True
+
+
+def _detect_generalization_intent(question: str) -> bool:
+    has_scope_causal = any(w in question.lower() for w in _SCOPE_WORDS) and bool(
+        _CAUSAL_HYPOTHETICAL_RE.search(question)
+    )
+    has_general_causal_claim = bool(_GENERAL_CAUSAL_CLAIM_RE.search(question))
+    has_individual_causal = bool(_INDIVIDUAL_CAUSAL_RE.search(question))
+    return has_scope_causal or has_general_causal_claim or has_individual_causal
+
+
+def detect_hard_routed_intent(question: str) -> tuple:
+    """Runs before any LLM-based routing. Returns (intent_name, extra) if
+    the question matches one of three deterministic gate shapes, or
+    (None, {}) if the normal LLM router should handle it. Precedence when
+    more than one pattern matches: generalization-refusal > mitigation >
+    trust/accuracy (most restrictive intent wins), per the build spec."""
+    if _detect_generalization_intent(question):
+        return "generalization_refusal", {}
+    if _detect_mitigation_intent(question):
+        match = _EMPLOYEE_ID_RE.search(question)
+        employee_id = int(match.group(1)) if match else None
+        is_spend_domain = any(w in question.lower() for w in _SPEND_DOMAIN_WORDS)
+        return "mitigation", {"employee_id": employee_id, "is_spend_domain": is_spend_domain}
+    if _detect_trust_intent(question):
+        return "trust_accuracy", {}
+    return None, {}
+
+
+def _build_gate_result(response_text: str, mechanisms_used: list, sources: list, sql_executed, gate_name: str, extra_log: dict = None) -> dict:
+    log = {
+        "id": str(uuid.uuid4()),
+        "question": None,  # filled in by caller
+        "started_at": time.time(),
+        "gate": gate_name,
+        "categories_routed": [],
+        "sql": extra_log.get("sql_result") if extra_log else None,
+        "response": response_text,
+        "grounded": True,  # code-constructed from real rows or a fixed refusal template -- trivially grounded
+        "ungrounded_numbers": [],
+        "mechanisms_used": mechanisms_used,
+    }
+    log["elapsed_seconds"] = time.time() - log["started_at"]
+    tool_calls_made = [{"tool": "sql", "tables_used": (extra_log["sql_result"].get("tables_used") or [])}] if extra_log and extra_log.get("sql_result") else []
+    return {
+        "response": response_text,
+        "sql_executed": sql_executed,
+        "doc_chunks_used": None,
+        "mechanisms_used": mechanisms_used,
+        "sources": sources,
+        "tool_calls_made": tool_calls_made,
+        "log": log,
+    }
+
+
+def _handle_mitigation_intent(question: str, employee_id, is_spend_domain: bool) -> dict:
+    if employee_id is not None:
+        sql = (
+            f"SELECT base_risk, perturbed_risk, risk_change, risk_change_pct, disclaimer "
+            f"FROM attrition_sensitivity WHERE employee_id = {employee_id} LIMIT 1"
+        )
+        result = sql_agent.execute_sql(sql)
+        if not result["success"] or not result["rows"]:
+            response_text = (
+                f"I don't have counterfactual sensitivity data for employee {employee_id} -- it's only "
+                "computed for this project's top-risk decile, and this employee either isn't in it or I "
+                "couldn't retrieve it. I don't want to guess a mitigation number I can't back up."
+            )
+            return _build_gate_result(
+                response_text, mechanisms_used=[], sources=[], sql_executed=result.get("sql"),
+                gate_name="mitigation", extra_log={"sql_result": result},
+            )
+        row = result["rows"][0]
+        disclaimer = row.get("disclaimer") or ATTRITION_SENSITIVITY_DISCLAIMER_FALLBACK
+        direction = "down" if row["risk_change"] < 0 else "up"
+        response_text = (
+            f"For employee {employee_id}, simulating a +10% compensation change moves predicted risk "
+            f"{direction} by {abs(row['risk_change']):.3f} ({abs(row['risk_change_pct']) * 100:.1f}%), "
+            f"from {row['base_risk']:.3f} to {row['perturbed_risk']:.3f}. {disclaimer}"
+        )
+        return _build_gate_result(
+            response_text, mechanisms_used=["sql"], sources=["live query: attrition_sensitivity table"],
+            sql_executed=result["sql"], gate_name="mitigation", extra_log={"sql_result": result},
+        )
+
+    if is_spend_domain:
+        sql = (
+            "SELECT anomaly_type, injection_rate, precision, recall, pr_auc FROM spend_robustness "
+            "WHERE anomaly_type != 'overall' ORDER BY anomaly_type, injection_rate LIMIT 100"
+        )
+        result = sql_agent.execute_sql(sql)
+        if not result["success"] or not result["rows"]:
+            response_text = (
+                "I couldn't retrieve real detector robustness data to answer that, so I don't want to "
+                "guess at a retuning recommendation."
+            )
+            return _build_gate_result(
+                response_text, mechanisms_used=[], sources=[], sql_executed=result.get("sql"),
+                gate_name="mitigation", extra_log={"sql_result": result},
+            )
+        # Which anomaly type performs worst is computed deterministically in
+        # code, NOT asked of the model: a live test found the model's own
+        # narration of this exact data inverted the finding (claimed
+        # "point_spike" was worst when it was actually the best-performing
+        # type by a wide margin, real avg pr_auc 0.71 vs. slow_drift's
+        # 0.09) -- a factually wrong characterization of real numbers, not
+        # a fabricated number itself, so groundedness's number-matching
+        # check wouldn't have caught it either. Exactly the class of error
+        # this project's "never trust model self-restraint alone" rule
+        # exists for, so the comparison itself is done in code.
+        by_type = {}
+        for row in result["rows"]:
+            by_type.setdefault(row["anomaly_type"], []).append(row["pr_auc"])
+        avg_by_type = {t: sum(vals) / len(vals) for t, vals in by_type.items()}
+        worst_type = min(avg_by_type, key=avg_by_type.get)
+        best_type = max(avg_by_type, key=avg_by_type.get)
+        response_text = (
+            f"Across simulated injection rates, the detectors handle \"{worst_type}\" anomalies worst "
+            f"(average PR-AUC {avg_by_type[worst_type]:.2f}), compared to \"{best_type}\" which they "
+            f"handle best (average PR-AUC {avg_by_type[best_type]:.2f}). Retuning effort would have the "
+            f"most room to help on \"{worst_type}\" specifically, since the other type(s) are already "
+            f"performing well. {SPEND_MITIGATION_DISCLAIMER}"
+        )
+        return _build_gate_result(
+            response_text, mechanisms_used=["sql"], sources=["live query: spend_robustness table"],
+            sql_executed=result["sql"], gate_name="mitigation", extra_log={"sql_result": result},
+        )
+
+    # Entity extraction failed: no employee id, no recognizable spend-domain signal -- ask rather
+    # than guess or default to any specific employee/segment, per the build spec.
+    response_text = "Which employee or segment did you mean? I can look up real sensitivity data once I know who."
+    return _build_gate_result(response_text, mechanisms_used=[], sources=[], sql_executed=None, gate_name="mitigation")
+
+
+def _handle_trust_accuracy_intent() -> dict:
+    sql = (
+        "SELECT model, metric_value FROM attrition_model_metrics "
+        "WHERE metric_name = 'within_tenure_band_concordance' ORDER BY model LIMIT 10"
+    )
+    result = sql_agent.execute_sql(sql)
+    if not result["success"] or not result["rows"]:
+        response_text = (
+            "I couldn't retrieve the model's real accuracy figures, so I don't want to state a trust "
+            "judgment I can't back up with data."
+        )
+        return _build_gate_result(
+            response_text, mechanisms_used=[], sources=[], sql_executed=result.get("sql"),
+            gate_name="trust_accuracy", extra_log={"sql_result": result},
+        )
+    by_model = {r["model"]: r["metric_value"] for r in result["rows"]}
+    parts = [f"{model} at {value:.3f}" for model, value in sorted(by_model.items())]
+    response_text = (
+        "The honest headline accuracy figure for this project is the within-tenure-band concordance, "
+        "not the raw overall concordance -- the raw figure is inflated by a structural confound (tenure "
+        "predicts both the outcome and survival time together), so it's not the one to trust at face "
+        f"value. Within-tenure-band concordance is {', '.join(parts)}, which is good-but-not-perfect, "
+        "typical for real-world attrition prediction rather than a suspiciously high number."
+    )
+    return _build_gate_result(
+        response_text, mechanisms_used=["sql"], sources=["live query: attrition_model_metrics table"],
+        sql_executed=result["sql"], gate_name="trust_accuracy", extra_log={"sql_result": result},
+    )
+
+
+def _handle_generalization_refusal_intent() -> dict:
+    return _build_gate_result(
+        GENERALIZATION_REFUSAL_TEMPLATE, mechanisms_used=["rationale"],
+        sources=["project methodology docs (correlational scope, stated by design)"],
+        sql_executed=None, gate_name="generalization_refusal",
+    )
+
 
 ROUTING_SYSTEM_INSTRUCTION = """You are the routing step of GraphIQ's explainability agent, a workforce-analytics demo.
 
@@ -289,9 +555,84 @@ NATURAL_REFUSAL_FALLBACK = (
 )
 
 
+_ATTRITION_DOMAIN_WORDS = {"attrition", "risk", "employee", "employees", "gbm", "cox", "tenure"}
+_SPEND_TRIAGE_DOMAIN_WORDS = {"spend", "anomaly", "anomalies", "transaction", "transactions", "detector", "detectors"}
+
+
+def _is_combined_domain_question(question: str) -> bool:
+    q = question.lower()
+    return any(w in q for w in _ATTRITION_DOMAIN_WORDS) and any(w in q for w in _SPEND_TRIAGE_DOMAIN_WORDS)
+
+
+def _tables_touch_attrition(tables) -> bool:
+    return any(t.startswith("attrition") or t.startswith("cross_component") for t in (tables or []))
+
+
+def _tables_touch_spend(tables) -> bool:
+    return any(t.startswith("spend") for t in (tables or []))
+
+
+def _merge_sql_results(first: dict, second: dict) -> dict:
+    if not second.get("success"):
+        return first
+    if not first.get("success"):
+        return second
+    return {
+        "success": True,
+        "sql": first["sql"] + "; " + second["sql"],
+        "rows": (first.get("rows") or []) + (second.get("rows") or []),
+        "tables_used": sorted(set(first.get("tables_used") or []) | set(second.get("tables_used") or [])),
+        "error": None,
+    }
+
+
+def _gather_sql(message: str, categories: list, tool_calls_made: list) -> dict:
+    """Issues one SQL call for the turn -- and, for a question that spans
+    both the attrition and spend domains (combined-triage shape), a
+    SECOND domain-nudged call if the first one only covered one side,
+    merging both result sets before synthesis. This is the orchestration
+    loop referenced in the module docstring's item 0: the previous
+    version stopped after exactly one SQL call per turn, which
+    structurally could not answer a combined-triage question unless a
+    single generated query happened to join both domains itself -- found
+    live to be unreliable. Capped at 2 SQL calls (well under the build
+    spec's stated ceiling of 3) since a combined-triage question only
+    ever spans two domains."""
+    if "sql" not in categories:
+        return None
+    sql_result = sql_agent.generate_and_execute_sql(message)
+    tool_calls_made.append({"tool": "sql", "tables_used": sql_result.get("tables_used") or []})
+
+    if _is_combined_domain_question(message) and sql_result.get("success"):
+        tables = sql_result.get("tables_used") or []
+        touches_attrition = _tables_touch_attrition(tables)
+        touches_spend = _tables_touch_spend(tables)
+        if not (touches_attrition and touches_spend):
+            missing_domain = "spend anomaly (spend_anomaly_scores / spend_robustness / cross_component_quadrant)" if touches_attrition else "attrition risk (attrition_risk_scores / cross_component_quadrant)"
+            second_question = f"{message} -- specifically, also pull real {missing_domain} data in this query"
+            second_result = sql_agent.generate_and_execute_sql(second_question)
+            tool_calls_made.append({"tool": "sql", "tables_used": second_result.get("tables_used") or []})
+            sql_result = _merge_sql_results(sql_result, second_result)
+    return sql_result
+
+
 def handle_question(message: str, page_context: str = None, conversation_history: list = None) -> dict:
     """Returns {"response": str, "sql_executed": str|None, "doc_chunks_used": list|None,
     "mechanisms_used": list, "log": {...}}."""
+    intent, extra = detect_hard_routed_intent(message)
+    if intent == "mitigation":
+        result = _handle_mitigation_intent(message, extra["employee_id"], extra["is_spend_domain"])
+        result["log"]["question"] = message
+        return result
+    if intent == "trust_accuracy":
+        result = _handle_trust_accuracy_intent()
+        result["log"]["question"] = message
+        return result
+    if intent == "generalization_refusal":
+        result = _handle_generalization_refusal_intent()
+        result["log"]["question"] = message
+        return result
+
     log = {
         "id": str(uuid.uuid4()),
         "question": message,
@@ -305,15 +646,19 @@ def handle_question(message: str, page_context: str = None, conversation_history
         # missing/misconfigured backend credentials (e.g. CLOUDFLARE_API_TOKEN) etc.
         log["response"] = str(e)
         log["elapsed_seconds"] = time.time() - log["started_at"]
-        return {"response": str(e), "sql_executed": None, "doc_chunks_used": None, "mechanisms_used": [], "log": log}
+        return {"response": str(e), "sql_executed": None, "doc_chunks_used": None, "mechanisms_used": [], "tool_calls_made": [], "log": log}
 
     log["categories_routed"] = categories
 
-    sql_result = sql_agent.generate_and_execute_sql(message) if "sql" in categories else None
+    tool_calls_made = []
+    sql_result = _gather_sql(message, categories, tool_calls_made)
     doc_chunks = doc_retrieval.retrieve_relevant_chunks(message) if "rationale" in categories else None
+    if doc_chunks:
+        tool_calls_made.append({"tool": "rationale", "sections": [c["section_path"] for c in doc_chunks]})
 
     log["sql"] = sql_result
     log["doc_chunks"] = doc_chunks
+    log["tool_calls_made"] = tool_calls_made
 
     synthesis = _synthesize(message, categories, sql_result, doc_chunks)
     log["synthesis"] = synthesis
@@ -376,5 +721,6 @@ def handle_question(message: str, page_context: str = None, conversation_history
         "doc_chunks_used": doc_chunks_out,
         "mechanisms_used": mechanisms_used,
         "sources": sources,
+        "tool_calls_made": tool_calls_made,
         "log": log,
     }

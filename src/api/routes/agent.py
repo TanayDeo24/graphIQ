@@ -37,4 +37,5 @@ def chat(request: ChatRequest):
         "doc_chunks_used": result["doc_chunks_used"],
         "mechanisms_used": result["mechanisms_used"],
         "sources": result["sources"],
+        "tool_calls_made": result["tool_calls_made"],
     }

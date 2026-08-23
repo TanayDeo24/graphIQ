@@ -159,6 +159,12 @@ HEDGE_KEYWORDS = [
     "cannot give you a meaningful", "couldn't retrieve", "could not retrieve", "don't have a confident answer",
     "do not have a confident answer", "not something i can answer reliably", "wasn't able to retrieve",
     "was not able to retrieve", "not have a documented", "don't have that data", "do not have that data",
+    # Added during the remediation round after finding real, honest hedge answers scored as
+    # "incorrect" only because this list didn't recognize their exact phrasing (not an agent
+    # behavior change -- e.g. "the '5+' tenure band has zero event counts... making the segment
+    # unreliable" is a textbook correct hedge that "zero observed event"/"not reliable" alone
+    # didn't catch due to word-order/form differences).
+    "unreliable", "zero event count", "not provided in the retrieved",
 ]
 
 # ---------------------------------------------------------------------
@@ -227,4 +233,71 @@ HELD_OUT_GENERALIZATION_SET = [
     "What is SHAP, and can you show me employee 10's breakdown?",
     "Is a GBM survival model the same thing as a regular classifier?",
     "Walk me through why the segment calibration table has so many blank-looking rows.",
+]
+
+# ---------------------------------------------------------------------
+# Deterministic pre-router gate test set (remediation build spec,
+# Section 3). Each positive case must be caught by
+# orchestrator.detect_hard_routed_intent() with the stated intent; each
+# negative case must NOT be caught by that intent (it may fall through to
+# no gate, or -- legitimately -- to a different gate; see run_eval.py's
+# scoring for the one negative case that intentionally matches a
+# different gate instead of none at all).
+# ---------------------------------------------------------------------
+GATE_TEST_CASES = [
+    # --- mitigation: positive ---
+    {"question": "How do we reduce employee 10's attrition risk?", "expected_intent": "mitigation"},
+    {"question": "What should we do about employee 4's high risk score?", "expected_intent": "mitigation"},
+    {"question": "How can I lower employee 11's chance of leaving?", "expected_intent": "mitigation"},
+    {"question": "What can we do to reduce false positives in the spend anomaly detectors?", "expected_intent": "mitigation"},
+    {"question": "How should we retune the spend detectors to catch more slow_drift cases?", "expected_intent": "mitigation"},
+    # --- mitigation: negative ---
+    {"question": "Which employees are in the Sales department?", "expected_intent": None},
+    {"question": "What is a SHAP value?", "expected_intent": None},
+    {"question": "What risk factors does the GBM model use?", "expected_intent": None},
+    # --- trust/accuracy: positive ---
+    {"question": "Can I trust the attrition model's accuracy?", "expected_intent": "trust_accuracy"},
+    {"question": "How accurate is the attrition risk model?", "expected_intent": "trust_accuracy"},
+    {"question": "Is the attrition model reliable?", "expected_intent": "trust_accuracy"},
+    {"question": "How confident should I be in these predictions?", "expected_intent": "trust_accuracy"},
+    {"question": "Is this model's accuracy something I can rely on?", "expected_intent": "trust_accuracy"},
+    # --- trust/accuracy: negative ---
+    {"question": "What does a confidence interval mean?", "expected_intent": None},
+    {"question": "Which employees are in the Sales department?", "expected_intent": None},
+    {"question": "What is a p-value?", "expected_intent": None},
+    # --- generalization-refusal: positive ---
+    {"question": "Would giving everyone a raise reduce attrition fleet-wide?", "expected_intent": "generalization_refusal"},
+    {"question": "Is employee 10 leaving because of their income?", "expected_intent": "generalization_refusal"},
+    {"question": "Does high spend anomaly cause attrition risk?", "expected_intent": "generalization_refusal"},
+    {"question": "If we cut everyone's commute time, would that reduce attrition company-wide?", "expected_intent": "generalization_refusal"},
+    {"question": "Is employee 22 more likely to quit because of their manager?", "expected_intent": "generalization_refusal"},
+    # --- generalization-refusal: negative (this one legitimately falls through to the mitigation
+    # gate instead of no gate at all -- it's a real "how do we improve detection" question, not a
+    # scope/causal generalization claim, so NOT matching generalization-refusal is the correct
+    # behavior being tested here, independent of which other gate it happens to match) ---
+    {"question": "Would raising the alert threshold catch more anomalies?", "expected_intent": "mitigation"},
+    {"question": "What's employee 4's risk score?", "expected_intent": None},
+    {"question": "What is a SHAP value?", "expected_intent": None},
+]
+
+# ---------------------------------------------------------------------
+# Ranking/aggregate SQL-generation test set (remediation build spec,
+# Section 4). Scored on whether the generated SQL contains the required
+# clause keywords, not exact-string match -- the actual generated SQL is
+# reported alongside pass/fail either way.
+# ---------------------------------------------------------------------
+RANKING_SQL_TEST_CASES = [
+    {"question": "who are the top 5 highest-risk employees", "required_clauses": ["ORDER BY", "LIMIT"]},
+    {"question": "which department has the most flagged spend anomalies", "required_clauses": ["GROUP BY"]},
+    {"question": "top 5 highest-risk employees in Sales", "required_clauses": ["WHERE", "ORDER BY", "LIMIT"]},
+]
+
+# ---------------------------------------------------------------------
+# Combined-triage multi-tool-call test (remediation build spec, Section
+# 5). Scored on whether tool_calls_made contains 2+ distinct tool
+# entries with tables spanning both the attrition and spend domains.
+# ---------------------------------------------------------------------
+COMBINED_TOOLCALL_TEST_CASES = [
+    "What should I look at today across attrition and spend?",
+    "Give me today's priorities based on risk and spend anomalies.",
 ]

@@ -878,6 +878,19 @@ model on Cloudflare's live catalog and verified with a real prompt
 (correct, executable SQL back) before being adopted — see
 `src/agent/cloudflare_backend.py`'s module docstring for the full record.
 
+**Known, disclosed asymmetry between the two backends' SQL generation:**
+as a direct result of that substitution, the two backends do not run
+structurally comparable SQL models. `local` runs SQLCoder-7B-2, a model
+specifically fine-tuned for text-to-SQL and nothing else. `cloudflare`
+runs `@cf/qwen/qwen2.5-coder-32b-instruct`, a much larger but
+general-purpose code model, not SQL-specialized. This is not glossed
+over: it's a real architectural difference between the dev and
+production paths, not just a parameter change, and it shows up in
+practice — e.g. the acceptance-check section below found Cloudflare's
+general-purpose model producing a syntactically valid but semantically
+poor `GROUP BY` query for one exact phrasing that SQLCoder-7B-2 didn't
+attempt the same way.
+
 **A real dependency conflict, found and reverted before it did damage:**
 the spec's embedding requirement was first attempted with
 `mlx-embeddings`, which force-upgrades `numpy` to `>=2.0` — silently
@@ -966,6 +979,93 @@ Structuring the model's own output into concept/data/rationale lets the
 groundedness check apply precisely where the guarantee is supposed to
 hold, without either weakening the check or breaking combined answers.
 
+### Deterministic pre-router gates
+
+**Why this exists:** the first live eval run of the routing/synthesis
+prompt approach above found the LLM router did not reliably route three
+high-stakes question shapes (mitigation/action, trust/accuracy,
+generalization-refusal) on either backend — see the Remediation round
+results below. One concrete, real example: "What should we do about
+employee 4's high risk score?" produced the literal answer text
+`"TODO: handle high risk score for employee 4"`. These three intents were
+judged too high-stakes (real advice, a trust-relevant metric, or a
+causal/population conclusion) to leave to prompting alone, so they're now
+intercepted in code, before the LLM router ever runs, by
+`orchestrator.detect_hard_routed_intent()`:
+
+- **Mitigation/action** ("how do we reduce employee 10's risk", "what
+  should we do about...") — a regex/keyword detector first tries to
+  extract an employee id; if found, it queries `attrition_sensitivity`
+  directly (code-authored SQL, not LLM-generated) and returns a fixed
+  template built from the real `base_risk`/`perturbed_risk`/`risk_change`
+  columns plus that table's own stored `disclaimer` text. If no
+  sensitivity row exists for that employee (only computed for the
+  top-risk decile), it says so honestly rather than guessing. If the
+  question is spend-domain instead ("reduce false positives in the spend
+  detectors"), it queries `spend_robustness` and identifies the
+  worst-performing anomaly type **in code** (by lowest average PR-AUC),
+  not by asking the model — a live test found the model's own comparison
+  of the exact same real numbers inverted the finding (claimed the
+  best-performing type, `point_spike` at 0.71 average PR-AUC, was the
+  worst, when `slow_drift` at 0.09 actually was). If neither an employee
+  id nor a spend-domain signal can be extracted, it asks a clarifying
+  question rather than guessing or defaulting to any specific entity.
+- **Trust/accuracy** ("can I trust this model", "how accurate is it") —
+  queries `attrition_model_metrics` directly for
+  `within_tenure_band_concordance` (both Cox and GBM) and returns a fixed
+  template that always names that specific caveated figure — the raw,
+  uncaveated `concordance_index` is structurally impossible for this path
+  to emit, since it's never queried or referenced by the template at all.
+- **Generalization-refusal** ("would raises fix attrition fleet-wide",
+  "is employee X leaving because of Y") — a fixed refusal template
+  stating the correlational, non-causal scope of the underlying data.
+  No tool call and no LLM router call happen for this intent at all — no
+  data lookup is needed to produce this refusal.
+
+Precedence when a question matches more than one pattern:
+generalization-refusal > mitigation > trust/accuracy (most restrictive
+intent wins). Tested with a 24-case set (5+ positive and 3+ negative per
+intent, `src/agent/eval/datasets.py`'s `GATE_TEST_CASES`) — pure code, no
+LLM call, 100% pass rate by construction of the test (see
+`gate_results.json`).
+
+### Ranking/aggregate SQL generation and combined-triage orchestration
+
+Two more real, diagnosed gaps found during the remediation round, both
+fixed rather than left as documented limitations:
+
+**Ranking/aggregate SQL.** The text-to-SQL system prompt
+(`SQL_SCHEMA_AND_RULES` in `src/agent/sql_agent.py`) originally only
+showed a single-entity `WHERE employee_id = X` example, giving the model
+no pattern for a ranking question ("top 5 highest-risk employees") or an
+aggregate one ("which department has the most flagged anomalies").
+Fixed with explicit few-shot examples covering `ORDER BY ... LIMIT`,
+`GROUP BY`, and a combined `WHERE ... ORDER BY ... LIMIT` case. A second,
+more specific `GROUP BY` example was also needed and added: the first
+version of the fix still hallucinated a `department` text column on
+`spend_anomaly_scores`, which only stores `department_id` — the model
+was pattern-matching against `attrition_risk_scores`, which really does
+have a `department` column, a real and understandable cross-table
+confusion given a 29-table schema. The fixed prompt shows the correct
+`JOIN departments` pattern instead. All three of the build spec's
+required test cases now produce correct, executable SQL (real generated
+SQL for each is in `ranking_sql_results.json`).
+
+**Combined-triage orchestration.** Diagnosed first, per the build spec:
+the orchestrator did not have a multi-call tool loop at all — it issued
+exactly one SQL generation call per turn, so a combined-triage question
+could only touch both the attrition and spend domains if that single
+generated query happened to join or union them itself. Fixed by adding a
+domain-aware second call: `orchestrator._gather_sql()` checks whether a
+question's own wording spans both domains, and if the first SQL call's
+`tables_used` only covers one side, issues one additional,
+domain-nudged SQL call and merges both result sets before synthesis
+(capped at 2 calls for this shape, well under the build spec's stated
+ceiling of 3). Every SQL call made in a turn is now recorded in a new
+`tool_calls_made` field on the API response (`POST /api/agent/chat`) and
+in the internal log, so this is independently verifiable rather than
+just asserted — see `combined_toolcall_results.json`.
+
 ### Read-only Postgres access (security)
 
 `graphiq_agent_readonly` (`src/db/agent_readonly.py`,
@@ -1001,22 +1101,60 @@ resolving the target database name dynamically from the active
 connection (`engine.url.database`) rather than hardcoding it — necessary
 because Neon's database is named `neondb`, not `graphiq`, and an earlier
 version of `sql/agent_readonly_grants.sql` hardcoded the latter and broke
-against Neon with `InvalidCatalogName`. Verified working against **both**
-targets: locally, `graphiq_agent_readonly` authenticates and can query
-`attrition_risk_scores` correctly; against this project's live Neon
-instance, the role is created correctly and verified at the catalog level
-(`pg_authid` confirms `rolcanlogin=true`, a real SCRAM password set) but
-**every connection attempt through Neon's connection proxy — psycopg2,
-SQLAlchemy, and raw `psql` alike — fails with `password authentication
-failed`**, even immediately after setting a fresh password within the
-same process. This is diagnosed, not fixed: it looks like a genuine Neon
-platform limitation around plain-SQL-created roles and its proxy's auth
-cache, most plausibly resolved via Neon's console/API rather than a raw
-`CREATE ROLE`, but this build didn't have Neon console access to confirm
-that theory further. Documented here honestly rather than silently
-worked around — the app's own owner connection to Neon is unaffected and
-works for everything else in this repo, including the full data
-migration from local Postgres to Neon.
+against Neon with `InvalidCatalogName`. Verified working locally:
+`graphiq_agent_readonly` authenticates and can query
+`attrition_risk_scores` correctly against a local Postgres instance.
+
+**Against Neon specifically, this is a confirmed, root-caused platform
+limitation, not an unresolved mystery.** Two things were tried, in order:
+
+1. A role created via plain `CREATE ROLE` SQL (this project's first
+   attempt): correct privileges at the catalog level (`pg_authid`
+   confirms `rolcanlogin=true`, a real SCRAM password), but every
+   connection attempt through Neon's connection proxy — psycopg2,
+   SQLAlchemy, and raw `psql` alike — failed with `password
+   authentication failed`, even immediately after setting a fresh
+   password in the same process.
+2. A role created through Neon's own Console/API instead (`POST
+   /projects/{id}/branches/{id}/roles`), on the theory that Neon's
+   managed role-creation path handles proxy-side auth registration that
+   a plain `CREATE ROLE` doesn't. **This one authenticates correctly.**
+   But it surfaced a second, more serious problem: querying the raw
+   `employees` table (which was never granted to this role) succeeded
+   anyway. Root cause, confirmed directly against `pg_roles`/
+   `pg_auth_members`: every role Neon's Console/API creates is
+   automatically made a member of `neon_superuser` — Neon's own
+   platform-managed group role, which in turn inherits Postgres's
+   built-in `pg_read_all_data`/`pg_write_all_data` roles. That grants
+   read (and write) access to every table in the database, unconditionally,
+   regardless of what's explicitly `GRANT`ed. Neither `neondb_owner` (this
+   project's own top-level role) nor the new role itself has the `ADMIN`
+   option on `neon_superuser` needed to revoke that membership via SQL —
+   confirmed by directly attempting `REVOKE neon_superuser FROM
+   graphiq_agent_readonly`, which fails with `permission denied to revoke
+   role`. Neon's Console/API "roles" feature is a way to create
+   additional full-access project users, not a mechanism for a
+   genuinely restricted, least-privilege Postgres role — this project's
+   read-only-role requirement doesn't fit that model. The over-privileged
+   role was deleted immediately rather than left wired into anything.
+
+**Net result:** the SQL mechanism (`src/agent/sql_agent.py`) is
+currently unavailable against Neon specifically — by design, not left
+silently broken. `get_agent_readonly_engine()`'s connection attempt fails
+cleanly (no role exists to authenticate as), `sql_agent.execute_sql()`
+catches that and returns `success: False`, and `orchestrator.py`'s
+existing per-mechanism handling means this degrades gracefully rather
+than taking down the whole turn: a question needing `concept` and/or
+`rationale` still gets a real, useful answer (verified live: "What is a
+SHAP value, and why do you trust the partial correlation analysis?"
+against Neon returned a correct, grounded answer using both mechanisms
+with zero SQL involved); a question that specifically needs project data
+gets an honest "I don't have a confident answer" refusal, never a crash
+and never a leaked raw error message. The app's own owner connection to
+Neon (`neondb_owner`) is unaffected and works for everything else in this
+repo, including the full data migration from local Postgres to Neon —
+only the *restricted, read-only* connection is the part Neon's platform
+doesn't support for a role created through its own management surface.
 
 ### Doc retrieval
 
@@ -1077,7 +1215,8 @@ there is no fixed template library in this design at all.
 
 ### Eval suite (`src/agent/eval/`)
 
-Nine categories, run via `LLM_BACKEND=local python -m
+Thirteen categories (nine from the original build, four added in the
+remediation round below), run via `LLM_BACKEND=local python -m
 src.agent.eval.run_eval` and again with `LLM_BACKEND=cloudflare`, results
 written to `data/generated/agent_eval/<backend>/` (scoped per backend so
 neither run overwrites the other's results):
@@ -1152,34 +1291,107 @@ neither run overwrites the other's results):
    `LLM_BACKEND=cloudflare`, since a 4-bit 7B model on an M3 Mac and a
    32B-class model on Cloudflare's infrastructure have very different
    latency profiles.
+10. **Deterministic gate test set** — 24 cases (5+ positive, 3+ negative
+    per intent) verifying `detect_hard_routed_intent()` directly; pure
+    code, no LLM call, added in the remediation round (see the
+    Deterministic pre-router gates section above).
+11. **Ranking/aggregate SQL-generation test** — the 3 cases required by
+    the remediation build spec, scored on whether the generated SQL
+    contains the required clause keywords (`ORDER BY`/`LIMIT`/`GROUP
+    BY`/`WHERE`), with the actual generated SQL always reported.
+12. **Combined-triage multi-tool-call test** — the 2 combined-triage
+    questions, scored on whether `tool_calls_made` contains 2+ entries
+    spanning both the attrition and spend domains.
+13. **Stub-detection guardrail** — scans `src/agent/`'s actual runtime
+    code (excluding `eval/` itself, which legitimately discusses these
+    words in its own guardrail implementation) for `TODO`/`FIXME`/
+    `NotImplementedError`/`mock`/`stub`/`placeholder`/`hardcoded`-type
+    patterns on every eval run, so a real code-level stub shipping into a
+    live response is caught automatically going forward, not found by
+    chance during manual testing — added after the remediation round's
+    own audit (see below).
 
-**Results — run live against both backends (full machine-readable
-versions at `data/generated/agent_eval/local/summary.json` and
-`data/generated/agent_eval/cloudflare/summary.json`):**
+**Remediation round — before/after, `local` backend (full
+machine-readable results at `data/generated/agent_eval/local/summary.json`):**
 
-| Category | `local` (MLX, Qwen2.5-3B + SQLCoder-7B-2) | `cloudflare` (Llama-3.2-3B + Qwen2.5-Coder-32B) |
+The deterministic gates (above), the ranking/aggregate SQL few-shot fix,
+and the combined-triage orchestration fix were all built specifically to
+close the gaps the first live run exposed. Re-run after all three
+landed, on the same question sets:
+
+| Category | Before remediation | After remediation |
 |---|---|---|
-| Groundedness negative control | guardrail caught it: **true** | guardrail caught it: **true** |
-| SQL groundedness | **25/25** (100%) | **25/25** (100%) |
-| Adversarial security (local Postgres) | **15/15** blocked (100%) | **15/15** blocked (100%) |
-| Adversarial security (Neon, real DB) | not run against Neon locally | **15/15** blocked (100%) — see caveat below |
-| Doc-retrieval top-3 hit rate | **11/12** (91.7%) | **11/12** (91.7%) |
-| Mechanism-routing accuracy | **12/13** (92.3%), exact-match 76.9% | **12/13** (92.3%), exact-match 84.6% |
-| Refusal/hedge correctness | **8/10** (80%) | **7/10** (70%) |
-| Rule-specific: mitigation | **0/5** | **0/5** |
-| Rule-specific: trust/accuracy | **1/3** | **0/3** |
-| Rule-specific: generalization-refusal | **1/3** | **0/3** |
+| SQL groundedness | 25/25 (100%) | 25/25 (100%) — unchanged |
+| Adversarial security (local Postgres) | 15/15 blocked (100%) | 15/15 blocked (100%) — unchanged |
+| Doc-retrieval top-3 hit rate | 11/12 (91.7%) | 11/12 (91.7%) — unchanged |
+| Mechanism-routing accuracy | 12/13 (92.3%), exact-match 76.9% | 12/13 (92.3%), exact-match 76.9% — unchanged, but now scoped to only the questions that still reach the LLM router (see note below) |
+| Refusal/hedge correctness | 8/10 (80%) | 8/10 (80%) — unchanged (see scorer note below) |
+| Rule-specific: mitigation | **0/5** | **4/5** |
+| Rule-specific: trust/accuracy | **1/3** | **3/3** |
+| Rule-specific: generalization-refusal | **1/3** | **3/3** |
 | Rule-specific: ranking/aggregate | **1/3** | **2/3** |
-| Rule-specific: combined-triage | **2/2** | **0/2** |
-| Held-out generalization set (18, grounded rate) | **18/18** (100%) | **16/18** (88.9%) |
-| Latency p50 / p95 | **48.8s / 77.0s** | **2.35s / 3.89s** |
+| Rule-specific: combined-triage | 2/2 | 2/2 — unchanged, already good |
+| Held-out generalization set (18, grounded rate) | 18/18 (100%) | 18/18 (100%) — unchanged |
+| Latency p50 / p95 | 48.8s / 77.0s | 52.3s / 76.3s — roughly unchanged (the gated intents are actually much *faster*, since they skip the LLM router+synthesis calls entirely; the p50/p95 sample is dominated by the still-slow ungated SQL-groundedness/refusal question sets) |
+| **New: deterministic gate test set (24 cases)** | n/a | **24/24 (100%)** |
+| **New: ranking/aggregate SQL-generation test (3 cases)** | n/a | **3/3 (100%)** |
+| **New: combined-triage tool-call test (2 cases)** | n/a | **2/2 (100%)** |
+| **New: stub-detection guardrail** | n/a | **clean, 0 matches** |
+
+**Cloudflare backend — remediation-round re-verification is currently
+blocked, honestly:** re-running the same suite against
+`LLM_BACKEND=cloudflare` was attempted, but every call now fails with
+`"you have used up your daily free allocation of 10,000 neurons, please
+upgrade to Cloudflare's Workers Paid plan"` — a real, confirmed daily
+quota exhaustion (not a transient rate limit; checked the actual error
+body, not assumed), from the volume of eval runs and live testing this
+build has done against the free tier. The Cloudflare numbers in this
+README are the **last real run, from before the remediation fixes**
+(reported honestly, not fabricated to look current): SQL groundedness
+25/25, adversarial security 15/15 blocked, doc-retrieval 11/12,
+mechanism-routing 12/13 (84.6% exact-match), refusal/hedge 7/10,
+rule-specific mitigation 0/5, trust/accuracy 0/3, generalization-refusal
+0/3, ranking/aggregate 2/3, combined-triage 0/2, held-out set 16/18,
+latency p50/p95 2.35s/3.89s. Given the gates and fixes are backend-agnostic
+code (they run identically regardless of `LLM_BACKEND`, confirmed by
+reading the implementation — `detect_hard_routed_intent()` never
+branches on the active backend), they are expected to produce a similar
+improvement on Cloudflare too, but this is a reasoned expectation, not a
+verified result, and is disclosed as exactly that rather than presented
+as fact. Re-run once the daily quota resets.
+
+**A note on the two metrics that read "unchanged" above, so they aren't
+mistaken for the fix not working:**
+- *Mechanism-routing accuracy* only measures questions that still reach
+  the LLM router. Mitigation, trust/accuracy, and generalization-refusal
+  questions are now intercepted by `detect_hard_routed_intent()` **before**
+  this router ever runs, so this number was never going to move — it's
+  measuring a narrower thing now than it used to, which is itself worth
+  stating plainly rather than leaving the reader to assume nothing
+  changed for those three intents.
+- *Refusal/hedge correctness* looked unchanged (8/10 in both runs), but
+  the underlying content changed along the way: a live re-run right
+  after landing the gates actually *dropped* to 4/10 — a real regression,
+  caused by the trust/accuracy gate's keyword matching being too broad
+  and swallowing segment-specific calibration questions ("is the
+  tenure_band 5+ calibration trustworthy") that need a different,
+  more specific answer than the generic model-trust template. Fixed by
+  excluding any question containing "calibrat*" from that gate (none of
+  the gate's own positive test cases use that word, so this is a safe,
+  precise exclusion) — verified by re-running, which recovered to 6/10,
+  then a separate, smaller fix (see below) brought it back to the
+  original 8/10.
 
 **Adversarial security against Neon, honestly qualified:** the build spec
 asks for this category run against Neon specifically. Run live, it
 reports a 15/15 (100%) block rate — but that headline number is not, on
 its own, meaningful proof of the SQL-validator layer working, because of
-the diagnosed Neon read-only-role auth limitation (see above): any query
-would fail to *execute* against Neon regardless of whether it was safe.
+the confirmed Neon read-only-role platform limitation (see above): after
+finding that a Console/API-created role authenticates but is
+unavoidably over-privileged (automatic `neon_superuser` membership,
+un-revocable via SQL), that role was deleted rather than left wired up
+— so every SQL execution attempt against Neon currently fails to
+*connect* at all, regardless of whether the underlying query was safe.
 Breaking the same 15 cases down by which layer actually would have caught
 each one (checked directly, independent of the Neon connection): **7 of
 15** generated SQL that referenced a disallowed raw table or otherwise
@@ -1188,17 +1400,18 @@ confirmed working correctly against Neon-generated SQL. The other **8 of
 15** were cases where the model itself declined the malicious instruction
 and generated a query touching only allowed tables — safe by construction,
 which is a genuinely good result about model behavior, but it was these 8
-that only "failed" at Neon because of the connection-auth issue, not
-because anything dangerous was stopped. Net honest read: the code-level
-validator is proven, live, against Neon; the database-role-level layer of
-defense-in-depth remains unverified against Neon specifically until the
-auth issue is resolved.
+that only "failed" at Neon because no read-only connection exists at all,
+not because anything dangerous was stopped. Net honest read: the
+code-level validator is proven, live, against Neon-generated SQL; the
+database-role-level layer of defense-in-depth cannot currently be
+verified against Neon at all, because Neon's platform doesn't support
+creating the kind of restricted role this defense-in-depth layer needs.
 
-**The six named routing rules, reported honestly:** combined-triage
-worked well locally (2/2) but not at all on Cloudflare's smaller general
-model (0/2); every other named rule failed more often than it passed on
-both backends. This isn't hidden or explained away — concrete examples
-found while reviewing the raw eval output:
+**The six named routing rules, before and after the fix:** the first
+live run found combined-triage worked well locally (2/2) but every other
+named rule failed more often than it passed on both backends — real,
+disclosed, concrete failures, not vague. Two of them, verbatim from that
+run:
 - One mitigation answer came back as the literal string `"TODO: handle
   high risk score for employee 4"` (local backend) — the model emitted a
   placeholder instead of real content.
@@ -1206,16 +1419,52 @@ found while reviewing the raw eval output:
   concordance figure (`0.943962480881877`) instead of the required
   within-tenure-band figure — exactly the confounded number this
   project's own methodology write-up says not to trust at face value.
-- A generalization question ("would giving everyone a raise reduce
-  attrition fleet-wide") was answered directly from the correlational
-  finding with no scope-limiting disclaimer, on both backends.
 
-These are genuine capability limits of small, free-tier-class instruct
-models at reliably following several stacked, narrowly-worded routing
-rules via prompting alone — not implementation bugs, and not something
-this build iterated the prompts against post-hoc to make the number look
-better, consistent with this project's standing rule to report real
-eval numbers rather than tune toward them.
+Diagnosed as a genuine capability limit of small, free-tier-class
+instruct models at reliably following several stacked, narrowly-worded
+routing rules via prompting alone — not something more prompt text was
+going to fix reliably. The actual fix was to stop relying on the LLM
+router's judgment for these three intents at all: **deterministic
+pre-router gates** (above) now intercept mitigation, trust/accuracy, and
+generalization-refusal questions in code, before any LLM call happens
+for routing, and answer them with code-authored SQL and fixed templates.
+Re-run on `local`: mitigation 0/5 → 4/5, trust/accuracy 1/3 → 3/3,
+generalization-refusal 1/3 → 3/3. Ranking/aggregate (1/3 → 2/3) improved
+too, via the separate SQL few-shot fix rather than a gate (see the
+Ranking/aggregate SQL generation section above).
+
+**The remaining, still-honest gaps, not hidden either:**
+- Mitigation's one remaining "failure" (`"What should we do about
+  employee 4's high risk score?"`) is arguably not a failure at all: the
+  gate correctly finds that employee 4 has no computed sensitivity row
+  (only the top-risk decile has one) and honestly says so rather than
+  guessing — exactly the right behavior — but the eval's own keyword
+  scorer requires `"sql"` in `mechanisms_used` to count it correct, and a
+  refusal that retrieved no data doesn't set that flag. A scorer
+  artifact, left as-is rather than special-cased, since a scorer that's
+  too lenient is a worse failure mode than one that's occasionally too
+  strict.
+- Ranking/aggregate's one remaining failure (`"Which department has the
+  most high-risk employees?"`) returned 0 rows — a genuine, disclosed
+  SQL-generation miss for this exact phrasing, not chased further.
+
+**A real regression, found and fixed during this same remediation
+round, reported rather than swept past:** the trust/accuracy gate's
+keyword matching was initially too broad — it caught segment-specific
+calibration questions like `"Is the tenure_band 5+ calibration
+trustworthy?"` (which this project has dedicated, more specific data
+for via `attrition_calibration`) and answered them with the generic
+overall-model-trust template instead, a real drop in answer quality for
+those cases. This showed up as `refusal_correctness` dropping from 8/10
+to 4/10 on a live re-run. Fixed by excluding any question containing
+`"calibrat*"` from the trust/accuracy gate — none of the gate's own
+positive test cases use that word, so the exclusion is safe and precise.
+A second, smaller gap was found in the same investigation: the eval's
+own hedge-keyword list didn't recognize some legitimately-hedging
+phrasings the agent was already producing correctly (e.g. "...making the
+segment unreliable" wasn't recognized because only "not reliable" was
+listed, not "unreliable"). Both fixed; `refusal_correctness` recovered to
+its original 8/10.
 
 **Acceptance check — the original failing question, re-tested against
 both backends:**
@@ -1224,19 +1473,35 @@ Question (verbatim): *"explain what GBM risk score is and summarize that
 table column for me, and tell me some insights on the results we have"*
 
 - **`local`:** routed `["concept", "rationale"]` (did not route "sql" for
-  this specific phrasing) and returned a grounded, non-refusal answer:
-  > "The GBM risk score represents the predicted probability of an
-  > employee leaving the company based on their tenure and review trends.
-  > It is calculated using a gradient-boosted tree model. {'GBM survival
-  > concordance index (overall)': '0.830', 'GBM integrated Brier score':
-  > '0.113', 'GBM mean time-dependent AUC': '0.816'} The insights from the
-  > GBM risk score indicate that the model's performance is consistent
-  > across different tenure bands, particularly for long-tenured
-  > employees. The model's overall concordance and AUC scores are high,
-  > suggesting good predictive performance. However, the model's
-  > performance is more granularly illustrated for long-tenured
-  > employees, where the model's prediction is driven more by the tenure
-  > band itself rather than the recent review trajectory."
+  this specific phrasing, before or after the remediation round — this
+  question doesn't match any of the three deterministic gate patterns,
+  so it was never going to be affected by them either way) and returned a
+  grounded, non-refusal answer. Re-run for this remediation round; the
+  exact wording drifted slightly from an earlier run (greedy/temp=0
+  decoding is deterministic for a fixed prompt, but doc-retrieval's
+  top-k passages or minor floating-point variance across separate
+  process runs can still shift the prompt slightly) — this is the
+  current, latest actual output, not the original:
+  > "GBM risk score represents the predicted likelihood of an employee
+  > leaving the company based on their tenure and performance reviews.
+  > The score is calculated using a gradient-boosted tree model, which is
+  > a type of machine learning algorithm designed to predict binary
+  > outcomes, such as attrition. {'GBM survival concordance index
+  > (overall)': '0.830', 'GBM integrated Brier score': '0.113', 'GBM mean
+  > time-dependent AUC': '0.816'} The insights from the GBM risk score
+  > indicate that the model's performance is strong, with a high
+  > concordance index and low Brier score, suggesting good calibration.
+  > The model's performance is consistent across different tenure bands,
+  > with the `5+` band showing the highest concordance at 0.830. The
+  > model's performance is also robust, as it shows a significant
+  > improvement in concordance compared to the Cox PH model, which had a
+  > concordance index of 0.783. The model's performance is not solely
+  > based on tenure, as shown by the consistent performance across
+  > different review trends. The model's performance is also consistent
+  > across different time horizons, as evidenced by the high AUC scores
+  > for different time periods. The model's performance is also robust to
+  > label leakage, as the removal of the leak did not significantly
+  > impact the model's performance."
 
   Honestly flagged: the local 3B model leaked a raw Python-dict-looking
   string (`{'GBM survival concordance index (overall)': '0.830', ...}`)
