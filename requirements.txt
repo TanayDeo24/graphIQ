@@ -24,17 +24,11 @@ pydantic>=2.6,<3
 tenacity>=8.0,<10
 sqlglot>=30.0,<31
 requests>=2.28,<3
-# Local LLM backend (LLM_BACKEND=local) -- Apple Silicon only. Not required
-# when LLM_BACKEND=cloudflare (e.g. in the deployed/production environment).
-mlx>=0.20,<1; sys_platform == "darwin"
-mlx-lm>=0.20,<1; sys_platform == "darwin"
-# Local embeddings for doc retrieval when LLM_BACKEND=local. NOT
-# mlx-embeddings -- that package forces numpy>=2, directly incompatible
-# with lifelines/scikit-survival's numpy<2 requirement (hit live: pip
-# force-upgraded numpy to 2.4.6 and broke lifelines on first install
-# attempt). sentence-transformers runs BGE on PyTorch (already a project
-# dependency for the spend autoencoder) and stays numpy<2 compatible.
-sentence-transformers>=3.0,<7; sys_platform == "darwin"
+# Local LLM backend (LLM_BACKEND=local) deps -- mlx, mlx-lm,
+# sentence-transformers -- live in requirements-local.txt, not here.
+# Apple Silicon only, and not needed for LLM_BACKEND=cloudflare (the
+# deployed/production setting) -- see requirements-local.txt's own header
+# comment and the README's Setup instructions for the two-file install.
 
 # DB
 sqlalchemy>=2.0,<2.1

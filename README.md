@@ -165,6 +165,9 @@ docker-compose up -d
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# If you'll run the explainability agent with LLM_BACKEND=local (Apple
+# Silicon MLX, dev only) also install the MLX-specific extras:
+pip install -r requirements-local.txt
 
 # 3. Download the real IBM dataset (needs a Kaggle API token at
 #    ~/.kaggle/kaggle.json or ~/.kaggle/access_token) — or download it
@@ -868,6 +871,23 @@ never branch on which backend is running.
 | Embeddings | BGE-base-en-v1.5 via `sentence-transformers` (PyTorch/MPS) | `@cf/baai/bge-base-en-v1.5` |
 | Cost | Free, macOS (Apple Silicon) only | Cloudflare Workers AI usage |
 | Memory | Single-slot model-swap cache — SQLCoder and the 3B model are never resident simultaneously, to fit a 16GB budget | N/A (remote) |
+
+**Dependency isolation:** `mlx`, `mlx-lm`, and `sentence-transformers`
+(all `local`-only) live in `requirements-local.txt`, not the main
+`requirements.txt` — a deploy target (Render, CI, or any non-macOS
+environment) never even attempts to install them, since it never runs
+`pip install -r requirements-local.txt` at all. This is on top of, not
+instead of, the actual guarantee: `src/agent/llm_backend.py` only
+imports `local_backend.py` (and therefore only imports `mlx`) when
+`LLM_BACKEND=local` is genuinely set — `cloudflare_backend.py` is
+imported instead for `LLM_BACKEND=cloudflare`, and neither is imported
+unconditionally at module load. Verified directly, not assumed: with
+`mlx` confirmed *not installed* (`pip show mlx` failing) in a clean venv
+and `LLM_BACKEND=cloudflare` set, `import src.api.main` succeeds — the
+actual scenario Render runs, not a same-machine proxy for it (this
+project's own dev machine has `mlx` installed regardless of
+`LLM_BACKEND`, so testing there alone can't catch this class of bug — a
+real gap found live in an earlier version of this verification).
 
 **Model substitution, found live, not assumed:** the build spec called
 for `@cf/defog/sqlcoder-7b-2` on Cloudflare. A direct call against this
