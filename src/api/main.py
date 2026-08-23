@@ -5,6 +5,8 @@ src/models/attrition/evaluate.py and src/models/spend/evaluate.py) — no
 route computes a metric at request time.
 """
 
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -20,9 +22,17 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# CORS_ALLOWED_ORIGIN: the deployed Cloudflare Workers dashboard domain in
+# production (set in Render's env vars, never hardcoded here since it's
+# only known after the Workers deployment exists). Local dev origins are
+# always allowed in addition, so `npm run dev` keeps working unconfigured.
+_LOCAL_DEV_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+_prod_origin = os.environ.get("CORS_ALLOWED_ORIGIN")
+_allowed_origins = _LOCAL_DEV_ORIGINS + ([_prod_origin] if _prod_origin else [])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_allowed_origins,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )

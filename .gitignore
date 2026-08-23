@@ -29,6 +29,11 @@ kaggle.json
 data/generated/*
 !data/generated/.gitkeep
 
+# --- Local LLM backend (LLM_BACKEND=local) ---
+# Locally-converted MLX model weights (SQLCoder-7B-2 4-bit, several GB) --
+# regenerated via mlx_lm.convert, not committed.
+models/
+
 # --- OS / editor ---
 .DS_Store
 .vscode/

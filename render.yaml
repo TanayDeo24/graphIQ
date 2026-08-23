@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: graphiq-api
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn src.api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: AGENT_READONLY_DB_USER
+        sync: false
+      - key: AGENT_READONLY_DB_PASSWORD
+        sync: false
+      - key: LLM_BACKEND
+        value: cloudflare
+      - key: CLOUDFLARE_ACCOUNT_ID
+        sync: false
+      - key: CLOUDFLARE_API_TOKEN
+        sync: false
+      - key: CLOUDFLARE_SQLCODER_MODEL
+        value: "@cf/qwen/qwen2.5-coder-32b-instruct"
+      - key: CLOUDFLARE_GENERAL_MODEL
+        value: "@cf/meta/llama-3.2-3b-instruct"
+      - key: CLOUDFLARE_EMBEDDING_MODEL
+        value: "@cf/baai/bge-base-en-v1.5"
+      - key: CORS_ALLOWED_ORIGIN
+        sync: false
