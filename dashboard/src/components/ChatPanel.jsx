@@ -9,25 +9,15 @@ const PAGE_CONTEXT_BY_PATH = {
   "/cross-component": "CrossComponentPage",
 };
 
-// Matches src/agent/eval/run_eval.py's HEDGE_TEMPLATES set: any response
-// the agent doesn't have a confident answer for, not just the generic
-// refusal_* family -- segment_calibration_zero_events/_low_confidence are
-// equally "no confident answer" outcomes (see README's Explainability
-// agent section for why they're separate templates from a generic
-// refusal in the first place). An earlier version of this check only
-// matched the refusal_ prefix, which rendered the calibration hedge
-// templates with normal-answer styling -- caught via a live screenshot.
-const HEDGE_TEMPLATES = new Set([
-  "refusal_not_found",
-  "refusal_out_of_scope",
-  "refusal_insufficient_data",
-  "refusal_groundedness_failed",
-  "segment_calibration_zero_events",
-  "segment_calibration_low_confidence",
-]);
-
-function isRefusal(templateUsed) {
-  return HEDGE_TEMPLATES.has(templateUsed);
+// The orchestrator returns an empty mechanisms_used list exactly when it
+// fell back to its natural-language "I don't have a confident answer"
+// text -- either nothing could be gathered, or a generated data claim
+// failed the groundedness check against the real SQL results. That's the
+// single, reliable signal for "this is a refusal/hedge," not a string
+// match on response text (the whole point of the natural-language
+// refusal is that it isn't a fixed, detectable template).
+function isRefusal(mechanismsUsed) {
+  return !mechanismsUsed || mechanismsUsed.length === 0;
 }
 
 export default function ChatPanel() {
@@ -70,14 +60,13 @@ export default function ChatPanel() {
           role: "model",
           text: result.response,
           sources: result.sources || [],
-          templateUsed: result.template_used,
-          toolCallsMade: result.tool_calls_made || [],
+          mechanismsUsed: result.mechanisms_used || [],
         },
       ]);
     } catch (err) {
       setError(
         err.response?.data?.detail ||
-          "The agent request failed. Check that the API server is running and GEMINI_API_KEY is configured."
+          "The agent request failed. Check that the API server is running and the LLM backend (LLM_BACKEND) is configured."
       );
     } finally {
       setLoading(false);
@@ -112,18 +101,19 @@ export default function ChatPanel() {
           <div className="chat-panel-messages" ref={listRef}>
             {messages.length === 0 && (
               <div className="chat-panel-empty">
-                Ask about attrition risk scores, calibration, spend-anomaly detectors, transaction
-                explanations, lead time, or the cross-component relationship. Every number in a response
-                traces back to an actual tool result -- if the agent can't ground an answer, it says so
-                instead of guessing.
+                Ask a general concept question ("what is a SHAP value"), a specific project data question
+                ("what's employee 42's risk score"), or a project rationale question ("why did the CUSUM
+                ranking change") -- or combine them. Any specific project number is checked against a real,
+                live query before being shown to you; if that check fails, the agent says so instead of
+                guessing.
               </div>
             )}
             {messages.map((m, i) => (
-              <div key={i} className={`chat-message ${m.role} ${m.role === "model" && isRefusal(m.templateUsed) ? "refusal" : ""}`}>
+              <div key={i} className={`chat-message ${m.role} ${m.role === "model" && isRefusal(m.mechanismsUsed) ? "refusal" : ""}`}>
                 <div className="chat-message-text">{m.text}</div>
                 {m.role === "model" && m.sources && m.sources.length > 0 && (
                   <div className="chat-message-sources">
-                    {isRefusal(m.templateUsed) && <span className="chat-refusal-tag">no confident answer</span>}
+                    {isRefusal(m.mechanismsUsed) && <span className="chat-refusal-tag">no confident answer</span>}
                     {m.sources.map((s, j) => (
                       <span key={j} className="chat-source-tag">
                         based on: {s}
