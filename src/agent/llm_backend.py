@@ -18,12 +18,36 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BACKEND = os.environ.get("LLM_BACKEND", "local")
+# No default. A missing LLM_BACKEND on a deploy target must fail loudly
+# and immediately, with a clear message pointing at the actual cause --
+# not silently fall back to "local" and crash three layers down inside
+# local_backend.py with a confusing `ModuleNotFoundError: No module named
+# 'mlx'` (mlx isn't even installed on non-macOS deploy targets in the
+# first place -- see requirements-local.txt). Found live: this exact
+# silent-default behavior is the most plausible reason a deploy target
+# with LLM_BACKEND unset in its real environment (as opposed to what
+# render.yaml *says* it should be -- render.yaml's envVars only
+# auto-apply to a service actually deployed as a Blueprint, not to an
+# existing service that was created manually through the dashboard
+# before render.yaml existed in this repo) would hit the mlx crash
+# despite this module's own conditional-import logic being correct.
+BACKEND = os.environ.get("LLM_BACKEND")
 
 if BACKEND == "local":
     from src.agent import local_backend as _impl
 elif BACKEND == "cloudflare":
     from src.agent import cloudflare_backend as _impl
+elif BACKEND is None:
+    raise RuntimeError(
+        "LLM_BACKEND is not set in the environment. This must be set explicitly to "
+        "'local' or 'cloudflare' -- there is no default, on purpose, so a missing "
+        "value fails immediately and clearly here rather than silently picking the "
+        "wrong backend and crashing later with an unrelated-looking import error. "
+        "Set LLM_BACKEND in your .env (local dev) or in the actual deploy "
+        "environment's env vars (Render dashboard -> Environment tab, not just "
+        "render.yaml -- render.yaml's envVars only auto-apply to a service deployed "
+        "as a Blueprint, not one created manually through the dashboard)."
+    )
 else:
     raise RuntimeError(f"Unknown LLM_BACKEND={BACKEND!r} -- expected 'local' or 'cloudflare'.")
 
