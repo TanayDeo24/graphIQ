@@ -31,8 +31,13 @@ data/generated/*
 
 # --- Local LLM backend (LLM_BACKEND=local) ---
 # Locally-converted MLX model weights (SQLCoder-7B-2 4-bit, several GB) --
-# regenerated via mlx_lm.convert, not committed.
-models/
+# regenerated via mlx_lm.convert, not committed. Anchored to the repo
+# root (leading slash) -- an earlier unanchored `models/` here matched
+# ANY directory named models anywhere in the tree, silently blocking new
+# files under src/models/ (real, committed application code) from ever
+# being tracked. Found live when a new file placed there didn't show up
+# in `git status` at all.
+/models/
 
 # --- OS / editor ---
 .DS_Store

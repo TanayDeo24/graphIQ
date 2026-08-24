@@ -1016,12 +1016,16 @@ intercepted in code, before the LLM router ever runs, by
 - **Mitigation/action** ("how do we reduce employee 10's risk", "what
   should we do about...") — a regex/keyword detector first tries to
   extract an employee id; if found, it queries `attrition_sensitivity`
-  directly (code-authored SQL, not LLM-generated) and returns a fixed
-  template built from the real `base_risk`/`perturbed_risk`/`risk_change`
-  columns plus that table's own stored `disclaimer` text. If no
-  sensitivity row exists for that employee (only computed for the
-  top-risk decile), it says so honestly rather than guessing. If the
-  question is spend-domain instead ("reduce false positives in the spend
+  directly (code-authored SQL, not LLM-generated), joined against
+  `attrition_risk_scores` for `is_top_risk_quartile`, and returns one of
+  two templates depending on that flag — a mitigation-framed response
+  with the real `base_risk`/`perturbed_risk`/`risk_change` numbers plus
+  that table's own stored `disclaimer` text for high-risk employees, or a
+  plain "not at meaningful risk, no mitigation indicated" response for
+  everyone else (see Live-testing findings below — sensitivity is now
+  computed for every employee, not a subset, so this branch decides
+  response framing, not data availability). If the question is
+  spend-domain instead ("reduce false positives in the spend
   detectors"), it queries `spend_robustness` and identifies the
   worst-performing anomaly type **in code** (by lowest average PR-AUC),
   not by asking the model — a live test found the model's own comparison
@@ -1085,6 +1089,90 @@ ceiling of 3). Every SQL call made in a turn is now recorded in a new
 `tool_calls_made` field on the API response (`POST /api/agent/chat`) and
 in the internal log, so this is independently verifiable rather than
 just asserted — see `combined_toolcall_results.json`.
+
+### Live-testing findings (production, not local-only)
+
+Four real, concrete bugs found by testing the actual deployed agent on
+Render — not hypothetical, not caught by any local eval run beforehand.
+Fixed and re-verified locally afterward.
+
+**1. Combined questions were dropping the ungated half.** "give me the
+risk score of employee 847 and an idea on how we can lower the score"
+matched the mitigation gate and returned only sensitivity-framed
+content — the plain risk-score fact was silently absorbed into the
+mitigation template's "from X to Y" phrasing rather than stated
+explicitly, reading as if it had been dropped. Fixed: `_handle_mitigation_intent()`
+now detects extra plain-fact requests in the same question (currently:
+risk score, department, tenure band — the columns already available from
+the same join) and prepends them as their own explicit sentence before
+the gated content, so a combined question visibly answers both parts
+rather than relying on a number being inferable from inside another
+sentence.
+
+**2. `sources`/`mechanisms_used` could be empty despite a real SQL
+execution.** Confirmed live: a response with `sql_executed` populated
+with a real, successful query still had `sources: []` and
+`mechanisms_used: []`. Root cause: `sql_executed` in the API response was
+populated whenever `sql_result["success"]` was true, but
+`mechanisms_used`/`sources` additionally required
+`synthesis.get("data_answer")` to be truthy — a real, confirmed
+divergence whenever SQL executed successfully but the synthesis step
+didn't end up writing anything into `data_answer` (a synthesis miss, not
+a tool-call failure). Fixed by deriving `mechanisms_used`/`sources` from
+whether the tool call itself succeeded (matching `tool_calls_made`,
+which already reliably reflects every real call made this turn),
+consistent with what `sql_executed`/`doc_chunks_used` already show,
+rather than gating on synthesis text separately.
+
+**3. `attrition_sensitivity` had a real population gap, not just a
+scoping question.** Confirmed live: employee 1876, the #1 highest-risk
+employee by `is_top_risk_quartile`, had no row in `attrition_sensitivity`
+at all. Diagnosed before fixing, per how this project handles findings
+like this: `attrition_sensitivity` had **309 of 1,470** employees (not
+309/some-decile — the actual restriction was `TOP_RISK_QUANTILE = 0.75`,
+the top quartile, applied on top of a SEPARATE, independent restriction
+to only `censored` employees — those with `event_observed == False`,
+i.e. still currently employed). Employee 1876 specifically has
+`event_observed = True` — they've already left — so they were excluded
+by the censored-only filter, independent of and in addition to the
+top-quartile cut; simply loosening the quantile threshold would not have
+fixed this specific case. Given sensitivity is a cheap, one-time offline
+computation (a handful of perturbed forward passes through the
+already-fitted model, not live inference), both restrictions were
+removed entirely: `counterfactual_sensitivity()`
+(`src/models/attrition/evaluate.py`) now computes a row for every
+employee in `full_df`, censored or not. Recomputed via a new, narrowly-scoped
+script (`src/models/attrition/recompute_sensitivity.py` — replicates
+`evaluate.py`'s own fit_view construction and GBM fit exactly, so results
+stay consistent with the rest of the `attrition_*` tables, without
+re-running and rewriting every other table those don't need to change).
+`SELECT COUNT(*) FROM attrition_sensitivity` is now **1,470** (was 309);
+employee 1876 now returns a real result (base risk 2.758, matching
+`attrition_risk_scores.gbm_risk_score` for the same employee exactly, as
+expected since both come from the same fitted model over the same
+`full_df`).
+
+One honest note on a real tension this surfaced: "simulating a raise" for
+someone who has already left the company (`event_observed = True`) is a
+retrospective counterfactual, not an actionable mitigation — you can't
+give a raise to someone who's gone. This wasn't specially handled: every
+employee gets the same sensitivity computation and the same response
+framing (fix 4 below) regardless of current employment status. Disclosed
+as a known simplification rather than silently resolved either way.
+
+**4. The mitigation response now branches by risk level.** Before this
+fix, every employee who reached this gate got the same
+mitigation-framed response, including ones who aren't at meaningful risk
+at all — misleading framing regardless of whether the underlying number
+was grounded. Now branches on `is_top_risk_quartile` (joined from
+`attrition_risk_scores` — the *same* threshold already used everywhere
+else in this project for "high risk," not a new one invented for this
+branch): the existing mitigation template for the high-risk group, and a
+plain "not in the high-risk group, no significant mitigation indicated"
+template — stating the real predicted risk number, explicitly declining
+the "here's how to lower it" framing — for everyone else. Verified
+against a real low-risk employee (employee 1, confirmed
+`is_top_risk_quartile = false` independently) and a real high-risk one.
 
 ### Read-only Postgres access (security)
 
@@ -1455,12 +1543,14 @@ Ranking/aggregate SQL generation section above).
 
 **The remaining, still-honest gaps, not hidden either:**
 - Mitigation's one remaining "failure" (`"What should we do about
-  employee 4's high risk score?"`) is arguably not a failure at all: the
-  gate correctly finds that employee 4 has no computed sensitivity row
-  (only the top-risk decile has one) and honestly says so rather than
-  guessing — exactly the right behavior — but the eval's own keyword
-  scorer requires `"sql"` in `mechanisms_used` to count it correct, and a
-  refusal that retrieved no data doesn't set that flag. A scorer
+  employee 4's high risk score?"`) was, at the time this was measured,
+  arguably not a failure at all: the gate correctly found that employee 4
+  had no computed sensitivity row (before the Live-testing findings
+  section below removed that restriction entirely) and honestly said so
+  rather than guessing — exactly the right behavior — but the eval's own
+  keyword scorer requires `"sql"` in `mechanisms_used` to count it
+  correct, and a refusal that retrieved no data doesn't set that flag. A
+  scorer
   artifact, left as-is rather than special-cased, since a scorer that's
   too lenient is a worse failure mode than one that's occasionally too
   strict.

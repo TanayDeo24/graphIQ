@@ -338,20 +338,31 @@ SENSITIVITY_DISCLAIMER = (
 
 
 def counterfactual_sensitivity(gbm, feature_columns, full_df: pd.DataFrame) -> pd.DataFrame:
-    censored = full_df[~full_df["event_observed"]].copy()
-    base_risk = gbm_survival.predict_risk(gbm, censored, feature_columns)
-    threshold = np.quantile(base_risk, TOP_RISK_QUANTILE)
-    high_risk = censored[base_risk >= threshold].copy()
-    high_risk_base_risk = base_risk[base_risk >= threshold]
+    """Computed for every employee, not just a top-risk subset: this is a
+    cheap, one-time offline computation (a handful of perturbed forward
+    passes through the already-fitted model, not live inference), and
+    restricting it to a "top risk" quantile turned out to have a real,
+    concrete cost -- the explainability agent's mitigation gate
+    (src/agent/orchestrator.py) needs a sensitivity row for whichever
+    specific employee a user asks about, and a live-testing finding
+    showed the #1 highest-risk employee on the dashboard (by
+    is_top_risk_quartile / attrition_risk_scores) had NO row here,
+    because that restriction was evaluated over only the CENSORED
+    subgroup (previously `full_df[~full_df["event_observed"]]`) --
+    excluding anyone whose attrition event had already occurred in the
+    observed data window, independent of and in addition to the
+    top-risk-quantile cut. Both restrictions removed; every employee in
+    full_df gets a row now, including ones whose event_observed is True."""
+    base_risk = gbm_survival.predict_risk(gbm, full_df, feature_columns)
 
-    perturbed = high_risk.copy()
+    perturbed = full_df.copy()
     perturbed["monthly_income"] = perturbed["monthly_income"] * (1 + SENSITIVITY_INCOME_BUMP)
     perturbed_risk = gbm_survival.predict_risk(gbm, perturbed, feature_columns)
 
     out = pd.DataFrame(
         {
-            "employee_id": high_risk["employee_id"].values,
-            "base_risk": high_risk_base_risk,
+            "employee_id": full_df["employee_id"].values,
+            "base_risk": base_risk,
             "perturbed_risk": perturbed_risk,
         }
     )

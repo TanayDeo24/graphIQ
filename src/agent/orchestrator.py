@@ -236,16 +236,25 @@ def _build_gate_result(response_text: str, mechanisms_used: list, sources: list,
 
 def _handle_mitigation_intent(question: str, employee_id, is_spend_domain: bool) -> dict:
     if employee_id is not None:
+        # is_top_risk_quartile is joined in from attrition_risk_scores -- the SAME threshold
+        # already used everywhere else in this project to mean "high risk" (TOP_RISK_QUANTILE in
+        # src/models/attrition/evaluate.py), not a new one invented for this branch. Every
+        # employee now has a real attrition_sensitivity row (recomputed for the full population,
+        # not just a top-risk subset -- a live-testing finding showed the #1 highest-risk employee
+        # on the dashboard had no row here, because the old computation restricted to a
+        # TOP_RISK_QUANTILE cut of censored employees only), so this branch decides response
+        # FRAMING, not data availability.
         sql = (
-            f"SELECT base_risk, perturbed_risk, risk_change, risk_change_pct, disclaimer "
-            f"FROM attrition_sensitivity WHERE employee_id = {employee_id} LIMIT 1"
+            f"SELECT s.base_risk, s.perturbed_risk, s.risk_change, s.risk_change_pct, s.disclaimer, "
+            f"r.is_top_risk_quartile, r.department, r.tenure_band FROM attrition_sensitivity s "
+            f"JOIN attrition_risk_scores r ON s.employee_id = r.employee_id "
+            f"WHERE s.employee_id = {employee_id} LIMIT 1"
         )
         result = sql_agent.execute_sql(sql)
         if not result["success"] or not result["rows"]:
             response_text = (
-                f"I don't have counterfactual sensitivity data for employee {employee_id} -- it's only "
-                "computed for this project's top-risk decile, and this employee either isn't in it or I "
-                "couldn't retrieve it. I don't want to guess a mitigation number I can't back up."
+                f"I don't have data for employee {employee_id} -- I couldn't retrieve their "
+                "sensitivity or risk data. I don't want to guess a mitigation number I can't back up."
             )
             return _build_gate_result(
                 response_text, mechanisms_used=[], sources=[], sql_executed=result.get("sql"),
@@ -253,14 +262,44 @@ def _handle_mitigation_intent(question: str, employee_id, is_spend_domain: bool)
             )
         row = result["rows"][0]
         disclaimer = row.get("disclaimer") or ATTRITION_SENSITIVITY_DISCLAIMER_FALLBACK
-        direction = "down" if row["risk_change"] < 0 else "up"
-        response_text = (
-            f"For employee {employee_id}, simulating a +10% compensation change moves predicted risk "
-            f"{direction} by {abs(row['risk_change']):.3f} ({abs(row['risk_change_pct']) * 100:.1f}%), "
-            f"from {row['base_risk']:.3f} to {row['perturbed_risk']:.3f}. {disclaimer}"
-        )
+
+        # Combined-question handling: a question matching the mitigation gate can ALSO carry a
+        # separate, plain data request in the same sentence ("give me the risk score of employee
+        # 847 AND an idea on how we can lower the score") -- found live to be silently dropped
+        # entirely when the gate only returned its own mitigation-framed content. The gate still
+        # owns the mitigation intent, but a plain fact explicitly asked for is prepended as its own
+        # sentence, stated directly rather than left to be inferred from inside the mitigation
+        # framing (base_risk previously only appeared embedded in "from X to Y" phrasing, which
+        # doesn't clearly read as "answering the risk-score question" on its own).
+        q = question.lower()
+        plain_facts = []
+        if "score" in q or "risk" in q:
+            plain_facts.append(f"employee {employee_id}'s current predicted risk score is {row['base_risk']:.3f}")
+        if "department" in q and row.get("department"):
+            plain_facts.append(f"they're in the {row['department']} department")
+        if "tenure" in q and row.get("tenure_band"):
+            plain_facts.append(f"their tenure band is {row['tenure_band']}")
+        plain_prefix = (", ".join(plain_facts).capitalize() + ". ") if plain_facts else ""
+
+        if row["is_top_risk_quartile"]:
+            direction = "down" if row["risk_change"] < 0 else "up"
+            response_text = (
+                f"{plain_prefix}Simulating a +10% compensation change moves predicted risk "
+                f"{direction} by {abs(row['risk_change']):.3f} ({abs(row['risk_change_pct']) * 100:.1f}%), "
+                f"from {row['base_risk']:.3f} to {row['perturbed_risk']:.3f}. {disclaimer}"
+            )
+        else:
+            # Low-risk branch: state the real number, explicitly say no significant mitigation is
+            # indicated -- "here's how to lower it" framing would itself be misleading for someone
+            # who isn't at meaningful risk, independent of whether the underlying number is grounded.
+            response_text = (
+                f"{plain_prefix}Employee {employee_id} is not in the project's high-risk group. "
+                "No significant mitigation is indicated here -- this employee isn't showing the kind "
+                "of elevated risk that would call for a retention intervention."
+            )
         return _build_gate_result(
-            response_text, mechanisms_used=["sql"], sources=["live query: attrition_sensitivity table"],
+            response_text, mechanisms_used=["sql"],
+            sources=["live query: attrition_sensitivity, attrition_risk_scores tables"],
             sql_executed=result["sql"], gate_name="mitigation", extra_log={"sql_result": result},
         )
 
@@ -693,17 +732,26 @@ def handle_question(message: str, page_context: str = None, conversation_history
         doc_chunks_out = None
         sources = []
     else:
+        # mechanisms_used/sources are derived from tool_calls_made (which reliably reflects every
+        # real SQL/doc-retrieval call this turn actually made) rather than solely from whether
+        # synthesis happened to populate the corresponding text field -- found live to diverge:
+        # sql_executed was shown in the API response whenever sql_result["success"] was true,
+        # independent of data_answer, but mechanisms_used/sources previously ALSO required
+        # data_answer to be truthy, so a turn where SQL executed successfully but synthesis left
+        # data_answer empty (a synthesis miss, not a tool-call failure) showed a real
+        # sql_executed query with an empty mechanisms_used/sources -- a real, confirmed
+        # inconsistency in the API response's own metadata, not just a cosmetic gap.
         mechanisms_used = []
         sources = []
         if synthesis.get("concept_answer"):
             mechanisms_used.append("concept")
             sources.append("general knowledge, not project-specific")
-        if synthesis.get("data_answer") and sql_result and sql_result["success"]:
+        if sql_result and sql_result["success"]:
             mechanisms_used.append("sql")
             tables = sql_result.get("tables_used") or []
             table_label = ", ".join(tables) if tables else "project data"
             sources.append(f"live query: {table_label} table{'s' if len(tables) != 1 else ''}")
-        if synthesis.get("rationale_answer") and doc_chunks:
+        if doc_chunks:
             mechanisms_used.append("rationale")
             sources.append("project methodology docs (" + "; ".join(c["section_path"] for c in doc_chunks[:2]) + ")")
         sql_executed_out = sql_result["sql"] if (sql_result and sql_result["success"]) else None
