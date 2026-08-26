@@ -64,7 +64,12 @@ def get_agent_readonly_database_url() -> str:
     user = os.environ.get("AGENT_READONLY_DB_USER", "graphiq_agent_readonly")
     password = os.environ.get("AGENT_READONLY_DB_PASSWORD", "")
     base = make_url(get_database_url())
-    return str(base.set(username=user, password=password))
+    # str(url) masks the password as "***" (a SQLAlchemy safety default for
+    # logging) -- render_as_string(hide_password=False) is required to get
+    # the real credential back out. Using str() here silently sent every
+    # agent SQL query to Postgres with the literal password "***", which
+    # surfaced only as an opaque "password authentication failed" error.
+    return base.set(username=user, password=password).render_as_string(hide_password=False)
 
 
 _agent_readonly_engine: Engine | None = None
