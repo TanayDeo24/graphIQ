@@ -3,10 +3,19 @@ from typing import List, Optional
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from src.agent import orchestrator
+from src.agent import orchestrator, sql_agent
 from src.agent.logging_store import append_log
 
 router = APIRouter()
+
+
+# TEMPORARY diagnostic endpoint -- to be removed once the production
+# read-only-DB connection failure is root-caused. Returns the raw
+# sql_agent result (including the real "error" string), which the
+# normal /chat endpoint deliberately never surfaces to callers.
+@router.get("/debug-sql")
+def debug_sql(question: str = "give me the risk score of employee 1876"):
+    return sql_agent.generate_and_execute_sql(question)
 
 
 class ConversationTurn(BaseModel):
